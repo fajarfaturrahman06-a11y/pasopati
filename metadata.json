@@ -1,0 +1,8 @@
+{
+  "name": "PASOPATI",
+  "description": "Protokol Audit Sistem & Operasi Pengamanan Agen TI — audit, remediasi taktis, dan kesiapan siber untuk pertahanan serta core infrastructure.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

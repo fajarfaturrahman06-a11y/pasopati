@@ -1,0 +1,177 @@
+/* Base Background & Typography */
+    .stApp {
+        background-color: #12151c !important;
+        color: #cbd5e1 !important;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    }
+
+    /* Top Banner / Header */
+    .tactical-header-card {
+        background: linear-gradient(180deg, #1b202a 0%, #151a22 100%);
+        border: 1px solid #2a3140;
+        border-left: 4px solid #ef4444;
+        border-radius: 8px;
+        padding: 18px 24px;
+        margin-bottom: 20px;
+        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    }
+    .tactical-title {
+        color: #f8fafc;
+        font-size: 1.55rem;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        margin: 0;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+    .tactical-subtitle {
+        color: #64748b;
+        font-size: 0.85rem;
+        margin-top: 4px;
+        letter-spacing: 0.02em;
+    }
+
+    /* Defense Metric Cards */
+    div[data-testid="stMetric"] {
+        background: #0d131f !important;
+        border: 1px solid #2a3140 !important;
+        border-radius: 6px !important;
+        padding: 14px 18px !important;
+        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3) !important;
+        transition: border-color 0.2s ease;
+    }
+    div[data-testid="stMetric"]:hover {
+        border-color: #334155 !important;
+    }
+    div[data-testid="stMetricLabel"] {
+        color: #64748b !important;
+        font-size: 0.75rem !important;
+        font-weight: 700 !important;
+        letter-spacing: 0.08em !important;
+        text-transform: uppercase !important;
+    }
+    div[data-testid="stMetricValue"] {
+        color: #f1f5f9 !important;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important;
+        font-size: 1.55rem !important;
+        font-weight: 700 !important;
+    }
+
+    /* Tactical Navigation Tabs */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 4px !important;
+        background-color: #0b111c !important;
+        padding: 6px !important;
+        border-radius: 8px !important;
+        border: 1px solid #2a3140 !important;
+    }
+    .stTabs [data-baseweb="tab"] {
+        height: 42px !important;
+        border-radius: 6px !important;
+        color: #64748b !important;
+        font-weight: 600 !important;
+        font-size: 0.82rem !important;
+        letter-spacing: 0.04em !important;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important;
+        padding: 0 16px !important;
+        border: 1px solid transparent !important;
+        transition: all 0.15s ease !important;
+    }
+    .stTabs [data-baseweb="tab"]:hover {
+        color: #cbd5e1 !important;
+        background-color: #111a2c !important;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: #131d31 !important;
+        color: #f87171 !important;
+        border: 1px solid #1e3a5f !important;
+        border-bottom: 2px solid #ef4444 !important;
+    }
+
+    /* High Precision Buttons */
+    .stButton > button {
+        background-color: #0f1f38 !important;
+        color: #e2e8f0 !important;
+        border: 1px solid #1e3a5f !important;
+        font-weight: 600 !important;
+        font-size: 0.82rem !important;
+        letter-spacing: 0.03em !important;
+        border-radius: 6px !important;
+        padding: 8px 16px !important;
+        transition: all 0.15s ease !important;
+    }
+    .stButton > button:hover {
+        background-color: #1e3a5f !important;
+        border-color: #f87171 !important;
+        color: #ffffff !important;
+    }
+
+    /* High-Density Tactical Badges */
+    .badge-pass {
+        background-color: rgba(16, 185, 129, 0.12);
+        color: #34d399;
+        border: 1px solid #059669;
+        padding: 3px 8px;
+        border-radius: 4px;
+        font-weight: 700;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+        font-size: 0.72rem;
+        letter-spacing: 0.05em;
+    }
+    .badge-warn {
+        background-color: rgba(245, 158, 11, 0.12);
+        color: #fbbf24;
+        border: 1px solid #d97706;
+        padding: 3px 8px;
+        border-radius: 4px;
+        font-weight: 700;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+        font-size: 0.72rem;
+        letter-spacing: 0.05em;
+    }
+    .badge-fail {
+        background-color: rgba(244, 63, 94, 0.12);
+        color: #fb7185;
+        border: 1px solid #e11d48;
+        padding: 3px 8px;
+        border-radius: 4px;
+        font-weight: 700;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+        font-size: 0.72rem;
+        letter-spacing: 0.05em;
+    }
+    .badge-tag {
+        background-color: #111a2c;
+        color: #94a3b8;
+        border: 1px solid #2a3140;
+        padding: 2px 7px;
+        border-radius: 4px;
+        font-size: 0.72rem;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+    }
+
+    /* Telemetry Panels & Containers */
+    .telemetry-card {
+        background-color: #0b111c;
+        border: 1px solid #2a3140;
+        border-radius: 6px;
+        padding: 14px 18px;
+        margin-bottom: 10px;
+    }
+    .telemetry-card:hover {
+        border-color: #334155;
+    }
+
+    /* Monospace Terminal Code Blocks */
+    pre, code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important;
+        font-size: 0.82rem !important;
+    }
+
+    /* Clean Sidebar */
+    section[data-testid="stSidebar"] {
+        background-color: #0b0e14 !important;
+        border-right: 1px solid #2a3140 !important;
+    }

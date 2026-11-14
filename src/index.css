@@ -1,0 +1,165 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    /* PASOPATI command palette — dark graphite + crimson/gold */
+    --bg-primary: #12151c;
+    --bg-secondary: #171b23;
+    --bg-panel: #1b202a;
+    --bg-inset: #0d1016;
+    --border-tactical: #2a3140;
+    --accent-crimson: #ef4444;
+    --accent-red: #dc2626;
+    --accent-gold: #d9a441;
+    --accent-cyan: #22d3ee;
+    --accent-emerald: #10b981;
+    --accent-amber: #f59e0b;
+  }
+
+  body {
+    background-color: #12151c;
+    color: #e5e9f0;
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    overflow-x: hidden;
+  }
+
+  code, pre, .font-mono {
+    font-family: 'JetBrains Mono', monospace;
+  }
+}
+
+/* Subtle command-grid backdrop for empty areas */
+.hud-grid {
+  background-size: 36px 36px;
+  background-image:
+    linear-gradient(to right, rgba(239, 68, 68, 0.035) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(239, 68, 68, 0.035) 1px, transparent 1px);
+}
+
+/* Panel used across dashboard */
+.pasopati-panel {
+  background: #1b202a;
+  border: 1px solid #2a3140;
+  border-radius: 12px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.22);
+}
+
+.pasopati-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 20px;
+  border-bottom: 1px solid #2a3140;
+}
+
+.pasopati-link {
+  color: #f87171;
+  font-size: 12px;
+  font-weight: 600;
+  transition: color 0.15s ease;
+}
+
+.pasopati-link:hover {
+  color: #fecaca;
+}
+
+/* Sidebar navigation */
+.pasopati-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 14px;
+  border-radius: 999px;
+  color: #a9b1c1;
+  font-size: 13.5px;
+  font-weight: 600;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.pasopati-nav-item:hover {
+  color: #f5f7fb;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.pasopati-nav-item.active {
+  color: #ffffff;
+  background: linear-gradient(90deg, #ef4444 0%, #b91c1c 100%);
+  box-shadow: 0 8px 22px rgba(239, 68, 68, 0.28);
+}
+
+.pasopati-nav-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  flex-shrink: 0;
+}
+
+.pasopati-nav-item.active .pasopati-nav-icon {
+  background: rgba(0, 0, 0, 0.22);
+}
+
+/* KPI tiles */
+.kpi-card {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 20px 22px;
+  background: #1b202a;
+  border: 1px solid #2a3140;
+  border-radius: 12px;
+  overflow: hidden;
+  transition: transform 0.18s ease, border-color 0.18s ease;
+}
+
+.kpi-card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(239, 68, 68, 0.45);
+}
+
+.kpi-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 58px;
+  height: 58px;
+  flex-shrink: 0;
+  border-radius: 10px;
+  color: #ef4444;
+  background: rgba(239, 68, 68, 0.10);
+  border: 1px solid rgba(239, 68, 68, 0.22);
+}
+
+/* Scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0d1016;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #333b4b;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #ef4444;
+}
+
+/* Simple entrance animation */
+@keyframes pasopatiFadeUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.pasopati-fade-up {
+  animation: pasopatiFadeUp 0.35s ease both;
+}

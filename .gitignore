@@ -1,0 +1,30 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+*.zip
+.env*
+!.env.example
+audit_result.json
+audit.json
+token.txt
+__pycache__/
+*.pyc
+data/
+
+# Konfigurasi lokal (berisi API key provider)
+opencode.json
+# Kunci pemulihan BitLocker per mesin
+bitlocker-recovery-*.txt
+
+# Runtime state + skrip berisi API key hardcoded (jangan pernah di-push)
+plan.json
+reapprove.ps1
+.freebuff/
+# Diblokir Windows Defender (PUA) — tidak bisa dibaca/di-commit
+setup-lan.ps1
+
+# Salinan folder bersarang (bukan submodule)
+satria-guard/
