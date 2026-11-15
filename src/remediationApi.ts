@@ -53,9 +53,10 @@ export async function reportManualEvidence(
 export async function approvePlan(
   planId: string,
   acknowledgeConsole = false,
-  selfApprove = false
+  selfApprove = false,
+  force = false
 ): Promise<{ planId: string; nonce: string; expiresAt: number; signature: string; token: string; plan: RemediationPlan }> {
-  return postJson('/api/remediation-approve', { planId, acknowledgeConsole, selfApprove });
+  return postJson('/api/remediation-approve', { planId, acknowledgeConsole, selfApprove, force });
 }
 
 export interface WhoAmI {

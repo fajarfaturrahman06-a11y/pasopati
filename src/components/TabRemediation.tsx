@@ -33,6 +33,7 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
   const [hostId, setHostId] = useState('');
   const [executionMode, setExecutionMode] = useState<'agent' | 'manual'>('agent');
   const [manualDone, setManualDone] = useState<Record<string, boolean>>({});
+  const [blockingPlanId, setBlockingPlanId] = useState<string>('');
 
   // Jam lokal untuk menghitung kedaluwarsa token (tanpa perlu refresh manual).
   React.useEffect(() => {
@@ -42,6 +43,8 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
   }, [plan]);
 
   const activePlanId = plan?.planId;
+  const planStatus = plan?.status;
+  const planDeviceId = plan?.deviceId;
   // Sinkronkan status plan dari server (approver bisa dari browser lain).
   React.useEffect(() => {
     if (!activePlanId) return;
@@ -59,6 +62,22 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
     }, 5000);
     return () => window.clearInterval(id);
   }, [activePlanId]);
+
+  // Deteksi plan aktif lain untuk host yang sama agar tombol force terlihat sebelum approve.
+  React.useEffect(() => {
+    if (!activePlanId || planStatus !== 'PLANNED') return;
+    let cancelled = false;
+    fetch('/api/remediation-plans', { credentials: 'same-origin' })
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => {
+        if (cancelled || !Array.isArray(d?.plans)) return;
+        const active = d.plans.find((p: RemediationPlan) => p.planId !== activePlanId && p.deviceId === planDeviceId &&
+          (p.status === 'EXECUTING' ? true : p.status === 'APPROVED' && (!p.evidenceDeadline || Date.now() < p.evidenceDeadline)));
+        setBlockingPlanId(active ? active.planId : '');
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [activePlanId, planStatus, planDeviceId]);
 
   const tokenExpiresAt = plan?.expiresAt ?? 0;
   const tokenExpired = Boolean(tokenExpiresAt) && nowMs >= tokenExpiresAt;
@@ -140,6 +159,7 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
       setAckConsole(false);
       setSelfApprove(false);
       setManualDone({});
+      setBlockingPlanId('');
       onShowToast('Plan remediasi ' + created.planId + ' dibuat (PLANNED, mode ' + executionMode + ').');
     } catch (err: any) {
       onShowToast(err?.message || 'Gagal membuat plan.', 'info');
@@ -148,14 +168,15 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
     }
   };
 
-  const handleApprovePlan = async () => {
+  const handleApprovePlan = async (force = false) => {
     if (!plan) return;
     setIsBusy(true);
+    setBlockingPlanId('');
     sfx.playPing();
     try {
       // approved.plan = plan LENGKAP sekali (berisi nonce/signature) — simpan langsung
       // untuk plan.json agent. JANGAN ambil dari GET (sudah diredaksi).
-      const approved = await approvePlan(plan.planId, ackConsole, selfApprove);
+      const approved = await approvePlan(plan.planId, ackConsole, selfApprove, force);
       setToken(approved.token);
       setPlan(approved.plan);
       setNowMs(Date.now());
@@ -165,7 +186,10 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
           : 'Plan disetujui. Token berlaku 10 menit — simpan plan.json sekarang (sekali tampil).'
       );
     } catch (err: any) {
-      onShowToast(err?.message || 'Gagal approve plan.', 'info');
+      const message = String(err?.message || 'Gagal approve plan.');
+      const match = message.match(/PLAN-[0-9-]+/);
+      if (match) setBlockingPlanId(match[0]);
+      onShowToast(message, 'info');
     } finally {
       setIsBusy(false);
     }
@@ -521,7 +545,7 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
           </button>
           <button
             disabled={isBusy || keyStatus !== 'ok' || !plan || (Boolean(plan.requiresConsoleAck) && !ackConsole) || (Boolean(whoami) && plan.createdBy === whoami?.name && !selfApprove) || !(plan.status === 'PLANNED' || (plan.status === 'APPROVED' && tokenExpired))}
-            onClick={handleApprovePlan}
+            onClick={() => handleApprovePlan(false)}
             className="flex-1 py-2.5 px-4 rounded-lg text-xs font-bold font-mono bg-sky-600 hover:bg-sky-500 text-white disabled:opacity-50 transition-all"
           >
             {isBusy ? 'MEMPROSES…' : plan?.status === 'APPROVED' && tokenExpired ? 'TERBITKAN ULANG TOKEN' : 'APPROVE PLAN'}
@@ -543,6 +567,21 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
         {plan && plan.status === 'PLANNED' && plan.requiresConsoleAck && !ackConsole && (
           <div className="text-[11px] font-mono text-amber-300">
             Tombol APPROVE nonaktif: centang konfirmasi konsol/KVM terlebih dahulu.
+          </div>
+        )}
+        {blockingPlanId && plan?.status === 'PLANNED' && (
+          <div className="rounded border border-amber-700 bg-amber-950/40 p-3 text-[11px] font-mono text-amber-200 space-y-2">
+            <div>
+              Host ini masih punya plan aktif <strong>{blockingPlanId}</strong>. Selesaikan/rollback plan itu, atau paksa approve plan ini.
+            </div>
+            <button
+              type="button"
+              onClick={() => handleApprovePlan(true)}
+              disabled={isBusy}
+              className="px-3 py-1.5 rounded bg-amber-600 hover:bg-amber-500 text-white font-bold disabled:opacity-50"
+            >
+              APPROVE PAKSA (override antrean)
+            </button>
           </div>
         )}
       </div>

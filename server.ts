@@ -1831,7 +1831,18 @@ app.post('/api/remediation-approve', requireRole('approver'), (req, res) => {
   }
   if (!override) {
     const active = Array.from(plansStore.values())
-      .filter(p => p.planId !== plan.planId && (p.status === 'APPROVED' || p.status === 'EXECUTING'));
+      .filter(p => {
+        if (p.planId === plan.planId) return false;
+        if (p.status === 'EXECUTING') {
+          return !p.heartbeatAt || Date.now() - Date.parse(String(p.heartbeatAt)) <= STALE_EXECUTING_MS;
+        }
+        if (p.status === 'APPROVED') {
+          // Plan kedaluwarsa (token + grace evidence habis) tidak boleh memblokir selamanya.
+          const deadline = p.evidenceDeadline || p.expiresAt || 0;
+          return !deadline || Date.now() < deadline;
+        }
+        return false;
+      });
     const sameHost = active.find(p => p.deviceId === plan.deviceId);
     if (sameHost) {
       return res.status(409).json({
