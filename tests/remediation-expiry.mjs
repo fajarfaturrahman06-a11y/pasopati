@@ -128,6 +128,36 @@ try {
     server.kill('SIGKILL');
     fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
+  // ---- C. mode manual: artefak terikat plan, unduhan tercatat, MANUAL_REPORTED → VERIFIED ----
+  {
+    const port = BASE_PORT + 2;
+    const { server, dataDir } = await boot(port, {});
+    const created = await req(port, 'POST', '/api/remediation-plan', {
+      deviceId: 'MANUAL-DEVICE',
+      executionMode: 'manual',
+      items: [{ alias: 'fw-enable-ufw', risk: 'LOW' }],
+      artifacts: { hardening: '#!/bin/bash\necho hard\n', rollback: '#!/bin/bash\necho roll\n' }
+    });
+    const planId = created.json?.plan?.planId;
+    check('Plan manual dibuat dengan hash artefak', created.status === 200 && Boolean(created.json?.plan?.artifacts?.hardeningHash), `status=${created.status}`);
+    const approved = await req(port, 'POST', '/api/remediation-approve', { planId, acknowledgeConsole: true, selfApprove: true });
+    const nonce = approved.json?.nonce;
+    const artifact = await fetch(`http://127.0.0.1:${port}/api/remediation-plans/${planId}/artifacts/hardening`, { headers: { 'X-Pasopati-API-Key': API_KEY } });
+    const artifactText = await artifact.text();
+    check('Artefak resmi dapat diunduh dan hash cocok', artifact.status === 200 && artifactText.includes('echo hard') &&
+      artifact.headers.get('x-pasopati-artifact-hash') === created.json?.plan?.artifacts?.hardeningHash, `status=${artifact.status}`);
+    const activity = await req(port, 'GET', '/api/admin/activity-audit?type=FILE_DOWNLOADED');
+    check('Unduhan artefak tercatat dengan planId', (activity.json?.records || []).some(r => r.planId === planId && String(r.subject).includes(planId)));
+    const manualEvidence = [{ stepIndex: 0, alias: 'fw-enable-ufw', exitCode: 0, outputHash: 'sha256:manual', source: 'manual' }];
+    const reported = await req(port, 'POST', '/api/remediation-verify', { planId, nonce, toStatus: 'MANUAL_REPORTED', source: 'manual', evidence: manualEvidence });
+    check('Laporan manual diterima sebagai MANUAL_REPORTED', reported.status === 200 && reported.json?.planStatus === 'MANUAL_REPORTED', `status=${reported.status}`);
+    const verified = await req(port, 'POST', '/api/remediation-verify', { planId, nonce, toStatus: 'VERIFIED', source: 'manual', evidence: manualEvidence, postAudit });
+    check('MANUAL_REPORTED naik ke VERIFIED setelah audit ulang', verified.status === 200 && verified.json?.planStatus === 'VERIFIED', `status=${verified.status}`);
+    const agentPlan = await req(port, 'POST', '/api/remediation-plan', { deviceId: 'AGENT-DEVICE', items: [{ alias: 'fw-enable-ufw', risk: 'LOW' }] });
+    check('Plan mode agent tanpa artefak tetap kompatibel', agentPlan.status === 200 && agentPlan.json?.plan?.executionMode === 'agent');
+    server.kill('SIGKILL');
+    fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
 } catch (err) {
   check('Uji expiry selesai tanpa exception', false, err?.message || String(err));
 }

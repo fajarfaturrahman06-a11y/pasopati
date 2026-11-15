@@ -28,14 +28,26 @@ export async function getJson<T>(path: string): Promise<T> {
 export async function createPlan(
   deviceId: string,
   items: RemediationPlanItem[],
-  hostId?: string
+  hostId?: string,
+  options?: { executionMode?: 'agent' | 'manual'; artifacts?: { hardening: string; rollback: string } }
 ): Promise<RemediationPlan> {
   const data = await postJson<{ plan: RemediationPlan }>('/api/remediation-plan', {
     deviceId,
     items,
-    ...(hostId ? { hostId } : {})
+    ...(hostId ? { hostId } : {}),
+    ...(options?.executionMode ? { executionMode: options.executionMode } : {}),
+    ...(options?.artifacts ? { artifacts: options.artifacts } : {})
   });
   return data.plan;
+}
+
+/** Laporan manual: tanpa HMAC, tetap memakai nonce plan yang sudah disetujui. */
+export async function reportManualEvidence(
+  planId: string,
+  nonce: string,
+  evidence: Array<{ stepIndex: number; alias: string; exitCode: number; outputHash: string; source: 'manual' }>
+): Promise<{ planStatus: string; evidenceCount: number }> {
+  return postJson('/api/remediation-verify', { planId, nonce, toStatus: 'MANUAL_REPORTED', source: 'manual', evidence });
 }
 
 export async function approvePlan(

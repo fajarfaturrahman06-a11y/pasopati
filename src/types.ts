@@ -100,7 +100,8 @@ export interface AuditLogEntry {
   deletedAt?: string;
 }
 
-export type PlanStatus = 'PLANNED' | 'APPROVED' | 'EXECUTING' | 'VERIFIED' | 'ROLLED_BACK' | 'FAILED';
+export type PlanStatus = 'PLANNED' | 'APPROVED' | 'EXECUTING' | 'MANUAL_REPORTED' | 'VERIFIED' | 'ROLLED_BACK' | 'FAILED';
+export type PlanExecutionMode = 'agent' | 'manual';
 
 export interface RemediationPlanItem {
   findingId: string;
@@ -118,6 +119,7 @@ export interface RemediationEvidence {
   alias: string;
   exitCode: number;
   outputHash: string;
+  source?: 'agent' | 'manual';
   output?: string;
   verified: boolean;
   advisory?: boolean;
@@ -132,6 +134,8 @@ export interface RemediationPlan {
   createdAt: string;
   items: RemediationPlanItem[];
   status: PlanStatus;
+  executionMode?: PlanExecutionMode;
+  artifacts?: { generatedAt: string; hardeningHash: string; rollbackHash: string };
   approvedBy?: string;
   approvedAt?: string;
   nonce?: string;

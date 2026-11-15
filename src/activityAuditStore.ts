@@ -15,6 +15,8 @@ export interface ActivityAuditRecord {
   sourceIp?: string;
   /** Nama berkas yang diunduh atau unit yang dipindai. */
   subject: string;
+  /** Plan terkait bila unduhan berasal dari artefak remediasi. */
+  planId?: string;
   /** Keterangan tambahan: status HTTP atau skor hasil scan. */
   detail: string;
   status: 'SUCCESS' | 'FAILED';
@@ -67,6 +69,7 @@ function openDatabase(filePath: string): InstanceType<typeof Database> {
         actor_role TEXT NOT NULL,
         source_ip TEXT,
         subject TEXT NOT NULL,
+        plan_id TEXT,
         detail TEXT NOT NULL,
         status TEXT NOT NULL CHECK (status IN ('SUCCESS', 'FAILED'))
       );
@@ -76,6 +79,10 @@ function openDatabase(filePath: string): InstanceType<typeof Database> {
         ON activity_audit (event_type, occurred_at DESC);
       PRAGMA user_version = 1;
     `);
+    const columns = db.prepare('PRAGMA table_info(activity_audit)').all() as Array<{ name: string }>;
+    if (!columns.some(column => column.name === 'plan_id')) {
+      db.exec('ALTER TABLE activity_audit ADD COLUMN plan_id TEXT');
+    }
     restrictDatabaseFilePermissions(resolvedPath);
     DATABASES.set(resolvedPath, db);
     return db;
@@ -104,6 +111,7 @@ export function readActivityAuditRecords(
     actorRole: String(row.actor_role),
     ...(row.source_ip ? { sourceIp: String(row.source_ip) } : {}),
     subject: String(row.subject),
+    ...(row.plan_id ? { planId: String(row.plan_id) } : {}),
     detail: String(row.detail),
     status: row.status
   })) as ActivityAuditRecord[];
@@ -124,8 +132,8 @@ export function appendActivityAuditRecord(filePath: string, record: ActivityAudi
     }
     db.prepare(`
       INSERT OR IGNORE INTO activity_audit (
-        id, occurred_at, event_type, actor, actor_role, source_ip, subject, detail, status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        id, occurred_at, event_type, actor, actor_role, source_ip, subject, plan_id, detail, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       record.id,
       record.occurredAt,
@@ -134,6 +142,7 @@ export function appendActivityAuditRecord(filePath: string, record: ActivityAudi
       record.actorRole,
       record.sourceIp ?? null,
       record.subject,
+      record.planId ?? null,
       record.detail,
       record.status
     );

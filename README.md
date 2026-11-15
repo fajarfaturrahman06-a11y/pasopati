@@ -90,8 +90,8 @@ Untuk mempermudah pengujian oleh Dewan Juri, repositori ini membagi sistem ke da
      `usb-storage-block`, `fw-enable-ufw`, `ssh-disable-root`, `auditd-enable`, `usb-block-linux`,
      `rdp-nla-enable`, `uac-enable`, `bitlocker-enable`, `grub-config-perms`,
      `sudoers-remove-nopasswd`, `suid-strip-critical`, `win-auditpol-process`.
-   - Alur UI: **2a** pilih perubahan → **2b** runbook dihasilkan dari pilihan (hardening + rollback, dry-run) →
-     **2c** approve (token 10 menit) → agent → evidence. Langkah advisory tidak memblokir plan dan dicatat di evidence.
+   - Alur UI: **2a** pilih perubahan → **2b** pratinjau runbook (berlabel PRATINJAU) → BUAT PLAN mengikat runbook ber-hash →
+     **2c** approve (token 10 menit) → eksekusi. Mode agent (default, terverifikasi) atau manual (self-reported; MANUAL_REPORTED, VERIFIED hanya setelah audit ulang). Artefak plan ber-hash dan unduhannya tercatat dengan planId. Langkah advisory tidak memblokir plan dan dicatat di evidence.
    - Plan wajib punya minimal satu langkah enforce; advisory saja ditolak 400.
    - Plan yang menyentuh jalur akses (`ports-block-*`, `fw-enable-*`, `ssh-disable-root`) wajib di-approve
      dengan konfirmasi jalur konsol; agent juga menahan eksekusi bila sesi remote akan terputus

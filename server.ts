@@ -592,7 +592,8 @@ function recordActivity(
   eventType: ActivityAuditEventType,
   subject: string,
   detail: string,
-  status: 'SUCCESS' | 'FAILED'
+  status: 'SUCCESS' | 'FAILED',
+  planId?: string
 ) {
   try {
     const principal = resolvePrincipal(req);
@@ -604,6 +605,7 @@ function recordActivity(
       actor: (principal?.name || 'anonim').slice(0, 80),
       actorRole: (principal?.role || 'anonim').slice(0, 20),
       ...(ip ? { sourceIp: ip } : {}),
+      ...(planId ? { planId: planId.slice(0, 60) } : {}),
       subject: subject.slice(0, 160),
       detail: detail.slice(0, 200),
       status
@@ -1428,7 +1430,8 @@ app.delete('/api/waivers/:deviceId/:id', requireRole('approver'), (req, res) => 
 // Server hanya menyimpan rencana + token; eksekusi nyata dilakukan agent (Fase C).
 // Tanpa persetujuan, agent TIDAK boleh mengubah konfigurasi apa pun (read-only).
 
-type PlanStatus = 'PLANNED' | 'APPROVED' | 'EXECUTING' | 'VERIFIED' | 'ROLLED_BACK' | 'FAILED';
+type PlanStatus = 'PLANNED' | 'APPROVED' | 'EXECUTING' | 'MANUAL_REPORTED' | 'VERIFIED' | 'ROLLED_BACK' | 'FAILED';
+type PlanExecutionMode = 'agent' | 'manual';
 interface PlanItem {
   findingId: string;
   alias: string; // ID tindakan dari allowlist agent (mis. 'fw-enable-ufw')
@@ -1446,6 +1449,10 @@ interface Plan {
   createdAt: string;
   items: PlanItem[];
   status: PlanStatus;
+  /** agent = token + pasopati_remediate.py; manual = unduh artefak + laporkan evidence. */
+  executionMode?: PlanExecutionMode;
+  artifacts?: { generatedAt: string; hardeningHash: string; rollbackHash: string };
+  manualEvidenceAt?: string;
   approvedBy?: string;
   approvedAt?: string;
   nonce?: string;
@@ -1465,6 +1472,40 @@ interface Plan {
 }
 
 const REMEDIATION_PLANS_PATH = path.join(DATA_DIR, 'remediation_plans.json');
+const REMEDIATION_ARTIFACTS_DIR = path.join(DATA_DIR, 'remediation_artifacts');
+
+type ArtifactKind = 'hardening' | 'rollback';
+interface StoredArtifacts { hardening: string; rollback: string; hardeningHash: string; rollbackHash: string; generatedAt: string }
+
+function artifactPath(planId: string) { return path.join(REMEDIATION_ARTIFACTS_DIR, `${planId}.json`); }
+function sha256Text(text: string) { return 'sha256:' + crypto.createHash('sha256').update(text, 'utf8').digest('hex'); }
+
+/** Simpan artefak runbook terikat plan; hash dipakai sebagai bukti unduhan. */
+function savePlanArtifacts(planId: string, hardening: string, rollback: string): StoredArtifacts {
+  fs.mkdirSync(REMEDIATION_ARTIFACTS_DIR, { recursive: true });
+  const stored: StoredArtifacts = {
+    hardening,
+    rollback,
+    hardeningHash: sha256Text(hardening),
+    rollbackHash: sha256Text(rollback),
+    generatedAt: new Date().toISOString()
+  };
+  writeJsonAtomic(artifactPath(planId), stored);
+  return stored;
+}
+
+function readPlanArtifacts(planId: string): StoredArtifacts | null {
+  try {
+    const file = artifactPath(planId);
+    if (!fs.existsSync(file)) return null;
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    if (!parsed || typeof parsed.hardening !== 'string' || typeof parsed.rollback !== 'string') return null;
+    return parsed as StoredArtifacts;
+  } catch (err) {
+    console.error('[PASOPATI] Gagal membaca artefak plan:', (err as Error).message);
+    return null;
+  }
+}
 const ALIAS_REGEX = /^[a-z0-9][a-z0-9-]{2,47}$/;
 // Sinkron dengan ALLOWLIST_ANALISA di pasopati_audit.py (20 alias: 16 enforce + 4 advisory).
 // Server menolak alias fiktif.
@@ -1531,8 +1572,9 @@ const ACCESS_RISK_ALIASES: Record<string, string> = {
 };
 const ALLOWED_TRANSITIONS: Record<PlanStatus, PlanStatus[]> = {
   PLANNED: ['APPROVED'],
-  APPROVED: ['EXECUTING', 'VERIFIED', 'ROLLED_BACK', 'FAILED'],
-  EXECUTING: ['VERIFIED', 'ROLLED_BACK', 'FAILED'],
+  APPROVED: ['EXECUTING', 'MANUAL_REPORTED', 'VERIFIED', 'ROLLED_BACK', 'FAILED'],
+  EXECUTING: ['MANUAL_REPORTED', 'VERIFIED', 'ROLLED_BACK', 'FAILED'],
+  MANUAL_REPORTED: ['VERIFIED', 'ROLLED_BACK', 'FAILED'],
   VERIFIED: [],
   ROLLED_BACK: [],
   FAILED: []
@@ -1695,7 +1737,7 @@ function validateItems(raw: any): PlanItem[] | null {
 // 1. Operator/dashboard membuat rencana per temuan (belum ada eksekusi)
 app.post('/api/remediation-plan', requireRole('planner'), (req, res) => {
   const principal = (req as Request & { principal?: Principal }).principal as Principal;
-  const { deviceId, items: rawItems, hostId } = req.body || {};
+  const { deviceId, items: rawItems, hostId, executionMode: rawMode, artifacts: rawArtifacts } = req.body || {};
   if (!deviceId || typeof deviceId !== 'string') {
     return res.status(400).json({ status: 'rejected', reason: 'deviceId wajib diisi.' });
   }
@@ -1725,6 +1767,15 @@ app.post('/api/remediation-plan', requireRole('planner'), (req, res) => {
   const accessNotes = items
     .filter(i => ACCESS_RISK_ALIASES[i.alias])
     .map(i => `${i.alias}: ${ACCESS_RISK_ALIASES[i.alias]}`);
+  const executionMode: PlanExecutionMode = rawMode === 'manual' ? 'manual' : 'agent';
+  const hardeningText = typeof rawArtifacts?.hardening === 'string' ? rawArtifacts.hardening : '';
+  const rollbackText = typeof rawArtifacts?.rollback === 'string' ? rawArtifacts.rollback : '';
+  if (hardeningText.length > 400_000 || rollbackText.length > 400_000) {
+    return res.status(413).json({ status: 'rejected', reason: 'Artefak runbook melebihi 400 KB.' });
+  }
+  if (executionMode === 'manual' && (!hardeningText || !rollbackText)) {
+    return res.status(400).json({ status: 'rejected', reason: 'Mode manual wajib menyertakan artefak hardening dan rollback.' });
+  }
   const plan: Plan = {
     planId: `PLAN-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
     deviceId: String(deviceId).slice(0, 64),
@@ -1733,10 +1784,20 @@ app.post('/api/remediation-plan', requireRole('planner'), (req, res) => {
     createdAt: new Date().toISOString(),
     items,
     status: 'PLANNED',
+    executionMode,
     requiresConsoleAck: accessNotes.length > 0,
     accessNotes,
     updatedAt: new Date().toISOString()
   };
+  try {
+    if (hardeningText && rollbackText) {
+      const stored = savePlanArtifacts(plan.planId, hardeningText, rollbackText);
+      plan.artifacts = { generatedAt: stored.generatedAt, hardeningHash: stored.hardeningHash, rollbackHash: stored.rollbackHash };
+    }
+  } catch (err) {
+    console.error('[PASOPATI] Gagal menyimpan artefak plan:', (err as Error).message);
+    return res.status(500).json({ status: 'rejected', reason: 'Artefak runbook gagal disimpan; plan tidak dibuat.' });
+  }
   plansStore.set(plan.planId, plan);
   savePlans(plansStore);
   return res.json({ status: 'success', plan });
@@ -1831,6 +1892,30 @@ app.post('/api/remediation-approve', requireRole('approver'), (req, res) => {
   return res.json({ status: 'success', planId: plan.planId, nonce: plan.nonce, expiresAt: plan.expiresAt, evidenceDeadline: plan.evidenceDeadline, signature: plan.signature, token: `${plan.nonce}.${plan.signature}`, plan: { ...plan } });
 });
 
+// Unduh artefak runbook terikat plan. Pratinjau (status PLANNED) tidak diaudit;
+// unduhan setelah plan dibuat/approve dicatat ke activity audit beserta planId.
+app.get('/api/remediation-plans/:planId/artifacts/:kind', requireRole('viewer', 'executor', 'agent'), rateLimit(60, 'plan-artifact'), (req, res) => {
+  const plan = plansStore.get(String(req.params.planId || ''));
+  if (!plan) return res.status(404).json({ status: 'rejected', reason: 'Plan tidak ditemukan.' });
+  const kind = String(req.params.kind || '') as ArtifactKind;
+  if (kind !== 'hardening' && kind !== 'rollback') {
+    return res.status(400).json({ status: 'rejected', reason: 'kind harus hardening atau rollback.' });
+  }
+  const stored = readPlanArtifacts(plan.planId);
+  if (!stored) return res.status(404).json({ status: 'rejected', reason: 'Artefak plan tidak tersedia; buat ulang plan.' });
+  const text = kind === 'hardening' ? stored.hardening : stored.rollback;
+  const hash = kind === 'hardening' ? stored.hardeningHash : stored.rollbackHash;
+  if (plan.status !== 'PLANNED') {
+    recordActivity(req, 'FILE_DOWNLOADED', `${plan.planId}.${kind}`, `plan=${plan.planId} hash=${hash}`, 'SUCCESS', plan.planId);
+  }
+  const ext = plan.items.some(item => WINDOWS_ALIASES.has(item.alias)) ? 'ps1' : 'sh';
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('X-Pasopati-Artifact-Hash', hash);
+  res.setHeader('X-Pasopati-Plan-Status', plan.status);
+  res.setHeader('Content-Disposition', `attachment; filename="pasopati-${plan.planId}-${kind}.${ext}"`);
+  return res.send(text);
+});
+
 // Endpoint/health access audit is separate from /api/audit-logs and is admin-only.
 app.get('/api/admin/endpoint-health-audit', requireRole('admin'), rateLimit(120, 'endpoint-health-audit-read'), (req, res) => {
   try {
@@ -1903,25 +1988,28 @@ app.post('/api/admin/endpoint-health-audit/access', requireRole('admin'), rateLi
 // Catatan jujur: status EXECUTING bersifat idempoten (nonce belum dikonsumsi) agar agent dapat
 // memanggil ulang; nonce baru dikonsumsi persisten pada VERIFIED/ROLLED_BACK/FAILED.
 app.post('/api/remediation-verify', requireRole('executor', 'agent'), rateLimit(60, 'evidence'), (req, res) => {
-  const auth = verifySignedRequest(
-    req,
-    HMAC_SECRET,
-    'Server belum siap: set HMAC_SECRET di environment.'
-  );
-  if (!auth.ok) {
-    return res.status(auth.status).json({ status: 'rejected', reason: auth.reason });
-  }
   const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, any>;
   const { planId, nonce, toStatus, evidence } = body;
   const plan = plansStore.get(String(planId || ''));
   if (!plan) return res.status(404).json({ status: 'rejected', reason: 'Plan tidak ditemukan.' });
+  const manual = plan.executionMode === 'manual' || body.source === 'manual';
+  if (!manual) {
+    const auth = verifySignedRequest(
+      req,
+      HMAC_SECRET,
+      'Server belum siap: set HMAC_SECRET di environment.'
+    );
+    if (!auth.ok) {
+      return res.status(auth.status).json({ status: 'rejected', reason: auth.reason });
+    }
+  }
   const principal = (req as Request & { principal?: Principal }).principal as Principal;
   if (plan.hostId && principal.kind === 'host' && principal.hostId !== plan.hostId) {
     return res.status(403).json({ status: 'rejected', reason: 'Plan ini terikat ke host lain.' });
   }
   const target = String(toStatus || '').toUpperCase() as PlanStatus;
-  if (!['EXECUTING', 'VERIFIED', 'ROLLED_BACK', 'FAILED'].includes(target)) {
-    return res.status(400).json({ status: 'rejected', reason: 'toStatus tidak valid (EXECUTING|VERIFIED|ROLLED_BACK|FAILED).' });
+  if (!['EXECUTING', 'MANUAL_REPORTED', 'VERIFIED', 'ROLLED_BACK', 'FAILED'].includes(target)) {
+    return res.status(400).json({ status: 'rejected', reason: 'toStatus tidak valid (EXECUTING|MANUAL_REPORTED|VERIFIED|ROLLED_BACK|FAILED).' });
   }
   if (!ALLOWED_TRANSITIONS[plan.status].includes(target)) {
     return res.status(409).json({ status: 'rejected', reason: `Transisi tidak diizinkan: ${plan.status} → ${target}.` });
@@ -1965,7 +2053,7 @@ app.post('/api/remediation-verify', requireRole('executor', 'agent'), rateLimit(
   // VERIFIED hanya boleh diklaim bila SELURUH langkah plan punya evidence,
   // semua exitCode 0, dan setiap langkah enforce benar-benar terverifikasi.
   // Status tidak lagi murni assertion agent.
-  if (target === 'VERIFIED') {
+  if (target === 'VERIFIED' || target === 'MANUAL_REPORTED') {
     const evidenceAliases = new Set(ev.map(e => String(e.alias)));
     const missing = plan.items.map(i => i.alias).filter(a => !evidenceAliases.has(a));
     if (missing.length > 0) {
@@ -1975,12 +2063,15 @@ app.post('/api/remediation-verify', requireRole('executor', 'agent'), rateLimit(
     if (failedExit.length > 0) {
       return res.status(400).json({ status: 'rejected', reason: `exitCode bukan 0 pada: ${failedExit.join(', ')}; gunakan FAILED/ROLLED_BACK.` });
     }
-    const unverified = ev
+    // Laporan manual bersifat self-reported, jadi flag verified tidak diwajibkan.
+    const unverified = manual ? [] : ev
       .filter(e => !(e.advisory === true || ADVISORY_ALIASES.has(String(e.alias))) && e.verified !== true)
       .map(e => String(e.alias));
     if (unverified.length > 0) {
       return res.status(400).json({ status: 'rejected', reason: `Langkah belum terverifikasi: ${unverified.join(', ')}.` });
     }
+  }
+  if (target === 'VERIFIED') {
     // Audit ulang pasca-remediasi: bukti bahwa host benar-benar berubah.
     const matrix = Array.isArray(body.postAudit?.compliance_matrix) ? body.postAudit.compliance_matrix : null;
     if (!matrix) {
@@ -2026,7 +2117,8 @@ app.post('/api/remediation-verify', requireRole('executor', 'agent'), rateLimit(
     outputHash: String(e.outputHash).slice(0, 128),
     ...(typeof e.preStateHash === 'string' ? { preStateHash: e.preStateHash.slice(0, 128) } : {}),
     ...(typeof e.output === 'string' ? { output: e.output.slice(0, 400) } : {}),
-    verified: e.verified === true,
+    verified: manual ? e.verified !== false : e.verified === true,
+    source: manual ? 'manual' as const : 'agent' as const,
     advisory: e.advisory === true || ADVISORY_ALIASES.has(String(e.alias)),
     ...(e.rollback && typeof e.rollback === 'object'
       ? {
@@ -2041,6 +2133,7 @@ app.post('/api/remediation-verify', requireRole('executor', 'agent'), rateLimit(
   }));
   // Jangan hapus evidence lama saat heartbeat EXECUTING tanpa muatan.
   plan.evidence = normalizedEvidence.length > 0 ? normalizedEvidence : plan.evidence;
+  if (target === 'MANUAL_REPORTED') plan.manualEvidenceAt = new Date().toISOString();
   plan.updatedAt = new Date().toISOString();
   plansStore.set(plan.planId, plan);
   if (['VERIFIED', 'ROLLED_BACK', 'FAILED'].includes(target) && plan.nonce) {
@@ -2049,7 +2142,7 @@ app.post('/api/remediation-verify', requireRole('executor', 'agent'), rateLimit(
   }
   savePlans(plansStore);
   const evidenceCount = plan.evidence?.length ?? 0;
-  if (['VERIFIED', 'ROLLED_BACK', 'FAILED'].includes(target)) {
+  if (['MANUAL_REPORTED', 'VERIFIED', 'ROLLED_BACK', 'FAILED'].includes(target)) {
     const verifiedCount = normalizedEvidence.filter(e => e.verified).length;
     appendAuditLogs([{
       id: `LOG-EVID-${plan.planId}-${Date.now()}`,
@@ -2058,10 +2151,12 @@ app.post('/api/remediation-verify', requireRole('executor', 'agent'), rateLimit(
       deviceName: plan.deviceId,
       deviceRole: 'Endpoint (evidence agen)',
       action: target === 'ROLLED_BACK' ? 'ROLLBACK RESTORATION' : 'HARDENING REMEDIATION',
-      operator: 'pasopati_remediate.py',
+      operator: manual ? `manual:${principal.name}` : 'pasopati_remediate.py',
       preScore: 0,
       postScore: Math.round((verifiedCount / Math.max(normalizedEvidence.length, 1)) * 100),
-      changesSummary: `Plan ${plan.planId} → ${target}: ${verifiedCount}/${normalizedEvidence.length} langkah terverifikasi (evidence HMAC valid).`,
+      changesSummary: manual
+        ? `Plan ${plan.planId} → ${target}: laporan manual oleh ${principal.name} (${verifiedCount}/${normalizedEvidence.length} langkah).`
+        : `Plan ${plan.planId} → ${target}: ${verifiedCount}/${normalizedEvidence.length} langkah terverifikasi (evidence HMAC valid).`,
       changesDetails: normalizedEvidence.slice(0, 10).map(e => `[${e.verified ? 'VERIFIED' : 'FAIL'}] ${e.alias} (exit ${e.exitCode})`),
       status: target === 'VERIFIED' ? 'SUCCESS' : target === 'FAILED' ? 'FAILED' : 'WARNING',
       storedInDb: true,

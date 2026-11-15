@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { DeviceInfo, RemediationPlan, RemediationPlanItem } from '../types';
-import { approvePlan, createPlan, getPlan, getWhoAmI, wslCommandText, agentCommandText, WhoAmI } from '../remediationApi';
+import { approvePlan, createPlan, getPlan, getWhoAmI, wslCommandText, agentCommandText, reportManualEvidence, WhoAmI } from '../remediationApi';
 import { VerificationBadge } from './VerificationBadges';
 import { sfx } from '../utils/audio';
 import { buildRemediationItems } from '../remediationMapping';
@@ -31,6 +31,8 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
   const [selfApprove, setSelfApprove] = useState(false);
   const [hosts, setHosts] = useState<Array<{ hostId: string; name: string; revokedAt?: string }>>([]);
   const [hostId, setHostId] = useState('');
+  const [executionMode, setExecutionMode] = useState<'agent' | 'manual'>('agent');
+  const [manualDone, setManualDone] = useState<Record<string, boolean>>({});
 
   // Jam lokal untuk menghitung kedaluwarsa token (tanpa perlu refresh manual).
   React.useEffect(() => {
@@ -110,12 +112,16 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
     setIsBusy(true);
     sfx.playPing();
     try {
-      const created = await createPlan(currentDevice.id, selectedItems, hostId || undefined);
+      const created = await createPlan(currentDevice.id, selectedItems, hostId || undefined, {
+        executionMode,
+        ...(executionMode === 'manual' ? { artifacts: { hardening: scripts.hard, rollback: scripts.roll } } : {})
+      });
       setPlan(created);
       setToken('');
       setAckConsole(false);
       setSelfApprove(false);
-      onShowToast('Plan remediasi ' + created.planId + ' dibuat (PLANNED).');
+      setManualDone({});
+      onShowToast('Plan remediasi ' + created.planId + ' dibuat (PLANNED, mode ' + executionMode + ').');
     } catch (err: any) {
       onShowToast(err?.message || 'Gagal membuat plan.', 'info');
     } finally {
@@ -163,6 +169,31 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
       onShowToast('Status plan diperbarui: ' + refreshed.status);
     } catch (err: any) {
       onShowToast(err?.message || 'Gagal refresh plan.', 'info');
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const handleManualReport = async () => {
+    if (!plan || !token) return;
+    if (!plan.items.every(item => manualDone[item.alias])) {
+      onShowToast('Tandai semua langkah selesai sebelum mengirim laporan manual.', 'info');
+      return;
+    }
+    setIsBusy(true);
+    try {
+      const stamp = new Date().toISOString();
+      const evidence = await Promise.all(plan.items.map(async (item, index) => {
+        const raw = `${plan.planId}|${item.alias}|${stamp}`;
+        const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw));
+        const hash = 'sha256:' + Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+        return { stepIndex: index, alias: item.alias, exitCode: 0, outputHash: hash, source: 'manual' as const };
+      }));
+      await reportManualEvidence(plan.planId, token.split('.')[0], evidence);
+      await handleRefresh();
+      onShowToast('Laporan manual tercatat. Jalankan audit ulang lalu kirim untuk status VERIFIED.');
+    } catch (err: any) {
+      onShowToast(err?.message || 'Gagal mengirim laporan manual.', 'info');
     } finally {
       setIsBusy(false);
     }
@@ -305,23 +336,49 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
           <div className="p-2.5 bg-slate-900 border-b border-slate-800 flex items-center justify-between flex-wrap gap-2">
             <span className="text-xs font-mono font-semibold text-rose-400 flex items-center gap-1.5">
               <FileJson className="w-3.5 h-3.5" />
-              2b. Runbook yang dihasilkan ({selectedItems.length} langkah terpilih)
+              {plan ? `2b. Runbook resmi plan ${plan.planId}` : '2b. Pratinjau runbook — belum tercatat'}
+              {!plan && <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 text-slate-400">PRATINJAU</span>}
             </span>
             <div className="flex items-center gap-2">
-              <button
-                onClick={() => downloadScript(scripts.hard, isLinux ? 'pasopati-hardening.sh' : 'pasopati-hardening.ps1')}
-                className="flex items-center gap-1 text-[11px] font-mono text-rose-400 hover:text-rose-300 px-2 py-0.5 rounded bg-rose-950/70 border border-rose-700/60"
-              >
-                <Download className="w-3 h-3" /> unduh hardening
-              </button>
-              <button
-                onClick={() => downloadScript(scripts.roll, isLinux ? 'pasopati-rollback.sh' : 'pasopati-rollback.ps1')}
-                className="flex items-center gap-1 text-[11px] font-mono text-sky-400 hover:text-sky-300 px-2 py-0.5 rounded bg-sky-950/70 border border-sky-700/60"
-              >
-                <Download className="w-3 h-3" /> unduh rollback
-              </button>
+              {plan ? (
+                <>
+                  <a
+                    href={`/api/remediation-plans/${encodeURIComponent(plan.planId)}/artifacts/hardening`}
+                    className="flex items-center gap-1 text-[11px] font-mono text-rose-400 hover:text-rose-300 px-2 py-0.5 rounded bg-rose-950/70 border border-rose-700/60"
+                  >
+                    <Download className="w-3 h-3" /> unduh hardening resmi
+                  </a>
+                  <a
+                    href={`/api/remediation-plans/${encodeURIComponent(plan.planId)}/artifacts/rollback`}
+                    className="flex items-center gap-1 text-[11px] font-mono text-sky-400 hover:text-sky-300 px-2 py-0.5 rounded bg-sky-950/70 border border-sky-700/60"
+                  >
+                    <Download className="w-3 h-3" /> unduh rollback resmi
+                  </a>
+                </>
+              ) : (
+                <>
+                  <button
+                    onClick={() => downloadScript(scripts.hard, isLinux ? 'pratinjau-hardening.sh' : 'pratinjau-hardening.ps1')}
+                    className="flex items-center gap-1 text-[11px] font-mono text-rose-400 hover:text-rose-300 px-2 py-0.5 rounded bg-rose-950/70 border border-rose-700/60"
+                  >
+                    <Download className="w-3 h-3" /> unduh pratinjau
+                  </button>
+                  <button
+                    onClick={() => downloadScript(scripts.roll, isLinux ? 'pratinjau-rollback.sh' : 'pratinjau-rollback.ps1')}
+                    className="flex items-center gap-1 text-[11px] font-mono text-sky-400 hover:text-sky-300 px-2 py-0.5 rounded bg-sky-950/70 border border-sky-700/60"
+                  >
+                    <Download className="w-3 h-3" /> unduh rollback pratinjau
+                  </button>
+                </>
+              )}
             </div>
           </div>
+          {plan?.artifacts && (
+            <div className="px-3 py-2 border-b border-slate-800 text-[10px] font-mono text-slate-400 break-all">
+              hash hardening: <span className="text-slate-300">{plan.artifacts.hardeningHash}</span>
+              <br />hash rollback: <span className="text-slate-300">{plan.artifacts.rollbackHash}</span>
+            </div>
+          )}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-0 divide-y lg:divide-y-0 lg:divide-x divide-slate-800">
             <div>
               <div className="px-3 py-2 text-[11px] font-mono text-rose-400 border-b border-slate-800 flex items-center justify-between">
@@ -416,6 +473,26 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
           </div>
         )}
 
+        <div className="flex flex-wrap items-center gap-3 text-[11px] font-mono text-slate-400">
+          <span className="text-slate-500">mode eksekusi:</span>
+          {(['agent', 'manual'] as const).map(mode => (
+            <label key={mode} className={`flex items-center gap-1.5 px-2 py-1 rounded border cursor-pointer ${
+              executionMode === mode ? 'border-rose-700 bg-rose-950/40 text-rose-200' : 'border-slate-700 bg-slate-900'
+            }`}>
+              <input
+                type="radio"
+                name="execution-mode"
+                checked={executionMode === mode}
+                disabled={Boolean(plan && plan.status !== 'PLANNED')}
+                onChange={() => setExecutionMode(mode)}
+                className="accent-rose-600"
+              />
+              {mode === 'agent' ? 'agent (token)' : 'manual (laporan)'}
+            </label>
+          ))}
+          {executionMode === 'manual' && <span className="text-amber-300/90">mode manual bersifat self-reported; VERIFIED butuh audit ulang.</span>}
+        </div>
+
         <div className="flex flex-col sm:flex-row gap-3 pt-1">
           <button
             disabled={isBusy || selectedEnforce.length === 0 || keyStatus !== 'ok'}
@@ -489,6 +566,38 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
             </div>
           )}
 
+          {plan.executionMode === 'manual' && plan.status === 'APPROVED' && !tokenExpired && (
+            <div className="space-y-2 rounded border border-amber-800 bg-amber-950/25 p-3">
+              <div className="text-[11px] font-mono font-bold text-amber-200 uppercase">Laporan manual — tandai langkah yang sudah dijalankan</div>
+              <p className="text-[11px] font-mono text-amber-100/80">
+                Unduh artefak resmi di 2b, jalankan, lalu tandai semua langkah. Server mencatat laporan sebagai MANUAL_REPORTED.
+              </p>
+              {plan.items.map((item, index) => (
+                <label key={item.alias} className="flex items-center gap-2 text-[11px] font-mono text-amber-100">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(manualDone[item.alias])}
+                    onChange={e => setManualDone(prev => ({ ...prev, [item.alias]: e.target.checked }))}
+                    className="accent-amber-500"
+                  />
+                  step {index + 1} · {item.alias} {item.kind === 'advisory' && <span className="text-slate-400">(advisory)</span>}
+                </label>
+              ))}
+              <button
+                onClick={handleManualReport}
+                disabled={isBusy || !plan.items.every(item => manualDone[item.alias])}
+                className="w-full sm:w-auto px-4 py-2 rounded-lg text-xs font-bold font-mono bg-amber-600 hover:bg-amber-500 text-white disabled:opacity-50"
+              >
+                {isBusy ? 'MENGIRIM…' : 'KIRIM LAPORAN MANUAL'}
+              </button>
+            </div>
+          )}
+
+          {plan.status === 'MANUAL_REPORTED' && (
+            <div className="p-3 rounded border border-amber-800 bg-amber-950/30 text-[11px] font-mono text-amber-200">
+              Laporan manual sudah tercatat. Status <strong>VERIFIED</strong> baru diberikan setelah audit ulang host; sertakan hasilnya pada pengiriman evidence berikutnya.
+            </div>
+          )}
           {plan.evidence && plan.evidence.length > 0 && (
             <div className="space-y-2">
               <span className="text-xs font-mono text-slate-400 font-semibold block">Evidence dari agent:</span>

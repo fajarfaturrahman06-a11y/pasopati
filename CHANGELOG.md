@@ -1,5 +1,22 @@
 # Changelog
 
+## Runbook terikat plan + mode manual — 15 Nov 2026
+
+### Ditambah
+- Runbook menjadi artefak plan (`data/remediation_artifacts/<planId>.json`) dengan hash SHA-256;
+  pratinjau tetap tersedia sebelum plan tetapi berlabel **PRATINJAU** dan tidak diaudit.
+- Unduhan artefak resmi lewat `GET /api/remediation-plans/:planId/artifacts/:kind`
+  (header hash + status plan) dan tercatat di activity audit beserta `planId` (kolom baru, migrasi otomatis).
+- Mode eksekusi plan: `agent` (default, token) atau `manual`. Mode manual wajib menyertakan
+  artefak saat membuat plan dan tetap mewajibkan approve/token.
+- Laporan manual: `MANUAL_REPORTED` (self-reported) → `VERIFIED` hanya setelah audit ulang.
+  Evidence manual ditandai `source: manual`; badge UI membedakan laporan manual dari verifikasi agent.
+- Test expiry diperluas: hash artefak, unduhan tercatat, MANUAL_REPORTED → VERIFIED, kompatibilitas plan agent.
+
+### Catatan
+- Plan agent lama tanpa artefak/mode tetap kompatibel (mode dianggap `agent`).
+- RBAC, HMAC agent, revisi endpoint, audit strict, dan format data tidak berubah.
+
 ## Perbaikan runner Python (venv) — 15 Nov 2026
 
 ### Diperbaiki
