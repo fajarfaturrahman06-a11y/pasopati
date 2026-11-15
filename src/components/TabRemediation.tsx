@@ -41,6 +41,25 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
     return () => window.clearInterval(id);
   }, [plan]);
 
+  const activePlanId = plan?.planId;
+  // Sinkronkan status plan dari server (approver bisa dari browser lain).
+  React.useEffect(() => {
+    if (!activePlanId) return;
+    const id = window.setInterval(async () => {
+      try {
+        const refreshed = await getPlan(activePlanId);
+        setPlan(prev => prev ? {
+          ...refreshed,
+          nonce: prev.nonce ?? refreshed.nonce,
+          signature: prev.signature ?? refreshed.signature,
+          expiresAt: prev.expiresAt ?? refreshed.expiresAt,
+          evidenceDeadline: prev.evidenceDeadline ?? refreshed.evidenceDeadline
+        } : refreshed);
+      } catch { /* biarkan status terakhir */ }
+    }, 5000);
+    return () => window.clearInterval(id);
+  }, [activePlanId]);
+
   const tokenExpiresAt = plan?.expiresAt ?? 0;
   const tokenExpired = Boolean(tokenExpiresAt) && nowMs >= tokenExpiresAt;
   const tokenRemainingSec = tokenExpiresAt ? Math.max(0, Math.ceil((tokenExpiresAt - nowMs) / 1000)) : 0;
@@ -545,6 +564,7 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
             <div className="p-3 rounded bg-slate-950 border border-slate-800">
               <span className="text-slate-500 block">Disetujui</span>
               <span className="text-slate-100 font-bold">{plan.approvedBy || '—'}</span>
+              {plan.approvedAt && <span className="block text-[10px] text-slate-500">{new Date(plan.approvedAt).toLocaleString('id-ID')}</span>}
             </div>
           </div>
 
