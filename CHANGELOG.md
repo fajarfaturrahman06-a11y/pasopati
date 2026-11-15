@@ -1,5 +1,18 @@
 # Changelog
 
+## Perbaikan runner Python (venv) — 15 Nov 2026
+
+### Diperbaiki
+- `scripts/run-python.mjs` memprioritaskan interpreter virtual environment proyek
+  (`.venv/Scripts/python.exe` di Windows, `.venv/bin/python` di POSIX) sebelum fallback
+  `py -3`/`python`/`python3`. Fallback tetap dipakai bila venv tidak ada.
+- Argumen diteruskan utuh dan exit code Python dipropagasikan; `PASOPATI_PYTHON_TRACE=1`
+  mencetak interpreter terpilih (path saja) untuk diagnosis/pengujian.
+- Regression `tests/run-python.mjs` membuktikan urutan venv → fallback, penerusan argumen,
+  dan exit code.
+- `tests/control-plane-smoke.mjs` memakai port 5700+ karena 3430–3529 dapat dieksklusikan
+  Windows/Hyper-V (`EACCES`).
+
 ## Perbaikan Windows EPERM pada atomic write — 15 Nov 2026
 
 ### Diperbaiki

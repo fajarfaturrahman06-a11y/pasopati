@@ -16,7 +16,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const PORT = 3200 + Math.floor(Math.random() * 300);
+// Hindari 3430-3529 yang dapat dieksklusikan Windows/Hyper-V.
+const PORT = 5700 + Math.floor(Math.random() * 300);
 const BASE = `http://127.0.0.1:${PORT}`;
 const API_KEY = 'smoke-test-api-key';
 const HMAC_SECRET = 'smoke-test-hmac-secret-0123456789abcdef';
