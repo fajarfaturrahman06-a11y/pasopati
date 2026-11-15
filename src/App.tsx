@@ -169,10 +169,17 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
+    let inFlight = false;
+    let timer: number | null = null;
     if (!sessionActive) return () => { cancelled = true; };
-    fetch('/api/audit-logs', { credentials: 'same-origin', cache: 'no-store' })
-      .then((r) => (r.ok ? r.json() : { logs: [] }))
-      .then((d) => {
+
+    const load = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        const r = await fetch('/api/audit-logs', { credentials: 'same-origin', cache: 'no-store' });
+        if (!r.ok) return;
+        const d = await r.json().catch(() => null);
         if (cancelled) return;
         const logs = Array.isArray(d?.logs) ? d.logs : [];
         setAuditLogs(
@@ -195,10 +202,21 @@ export default function App() {
               ...(typeof l.deletedAt === 'string' ? { deletedAt: l.deletedAt } : {})
             }))
         );
-      })
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, [sessionActive]);
+      } catch {
+        /* biarkan data terakhir */
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    void load();
+    // Tab Audit Log punya polling sendiri (menghormati filter arsip); tab lain tetap live.
+    if (activeTab !== 4) timer = window.setInterval(() => void load(), 5000);
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearInterval(timer);
+    };
+  }, [sessionActive, activeTab]);
 
   // Satu sumber data endpoint untuk seluruh halaman: server VPS. Mock hanya
   // ditampilkan dalam mode demo sampai browser berhasil terautentikasi.

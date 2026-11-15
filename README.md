@@ -176,6 +176,10 @@ Tanpa `--push-url`, hasil hanya tersimpan lokal di `audit.json` dan bisa diungga
 
 5. Isi **API key** dan **HMAC key** lalu klik **SIMPAN & KIRIM SCRIPT KE ENDPOINT**. Script langsung muncul di tab **Endpoint Audit** untuk host tersebut (masih menunggu approve sebelum bisa diunduh).
 
+**HMAC_SECRET**=tczED8as_EgvwoeMaBHd_kwwSqiZzZxwQwRZIwqOMaRgkhkJeSesYw8L5iv2wV_7
+
+**PASOPATI_API_KEY**=eDYl55Orb9ZyWeKReH30GGpQrIQfwbh1r62S8ZK2Yh47D_-NZ_NR_3Vukq85iAMk
+
 6. **APPROVE PLAN** (operator lain; jika Anda pembuatnya centang “setujui sendiri”). Token tampil **sekali** dan berlaku 10 menit.
 7. Jika host masih punya plan aktif, panel menampilkan plan penghalang: selesaikan/rollback, atau **APPROVE PAKSA**.
 

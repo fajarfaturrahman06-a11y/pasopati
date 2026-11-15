@@ -40,8 +40,8 @@ export const TabAuditLog: React.FC<TabAuditLogProps> = ({
   const storedCount = logs.filter((l) => l.storedInDb).length;
   const pendingCount = logs.length - storedCount;
 
-  const handleLoadFromDb = async () => {
-    setIsLoading(true);
+  const handleLoadFromDb = async (silent = false) => {
+    if (!silent) setIsLoading(true);
     try {
       const res = await fetch('/api/audit-logs' + (showArchived ? '?includeDeleted=1' : ''), { credentials: 'same-origin', headers: auditHeaders() });
       const data = await res.json().catch(() => null);
@@ -66,15 +66,25 @@ export const TabAuditLog: React.FC<TabAuditLogProps> = ({
           ...(typeof l.deletedAt === 'string' ? { deletedAt: l.deletedAt } : {})
         }));
       onLogsUpdated(mapped);
-      onShowToast(
-        `Riwayat audit dimuat dari database lokal (${mapped.length} entri${showArchived ? ', termasuk arsip' : ''}).`
-      );
+      if (!silent) {
+        onShowToast(
+          `Riwayat audit dimuat dari database lokal (${mapped.length} entri${showArchived ? ', termasuk arsip' : ''}).`
+        );
+      }
     } catch (err: any) {
-      onShowToast(`Gagal memuat dari database lokal: ${err?.message || ''}`, 'info');
+      if (!silent) onShowToast(`Gagal memuat dari database lokal: ${err?.message || ''}`, 'info');
     } finally {
-      setIsLoading(false);
+      if (!silent) setIsLoading(false);
     }
   };
+
+  // Live update tanpa mengganggu filter arsip; spinner tidak dipaksa tiap 5 detik.
+  React.useEffect(() => {
+    let cancelled = false;
+    const id = window.setInterval(() => { if (!cancelled) void handleLoadFromDb(true); }, 5000);
+    return () => { cancelled = true; window.clearInterval(id); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showArchived]);
 
   const handleSaveToDb = async () => {
     setIsSaving(true);
@@ -180,7 +190,7 @@ export const TabAuditLog: React.FC<TabAuditLogProps> = ({
             </button>
 
             <button
-              onClick={handleLoadFromDb}
+              onClick={() => void handleLoadFromDb()}
               disabled={isLoading}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-mono font-bold bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-700 transition-all disabled:opacity-50"
               title="Muat riwayat audit dari database lokal"
