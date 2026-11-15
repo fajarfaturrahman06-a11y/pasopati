@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { DeviceInfo, RemediationPlan, RemediationPlanItem } from '../types';
-import { approvePlan, createPlan, getPlan, getWhoAmI, wslCommandText, agentCommandText, reportManualEvidence, WhoAmI } from '../remediationApi';
+import { approvePlan, createPlan, getPlan, getWhoAmI, wslCommandText, agentCommandText, reportManualEvidence, sendAgentCredentials, WhoAmI } from '../remediationApi';
 import { VerificationBadge } from './VerificationBadges';
 import { sfx } from '../utils/audio';
 import { buildRemediationItems } from '../remediationMapping';
@@ -35,6 +35,7 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
   const [executionMode, setExecutionMode] = useState<'agent' | 'manual'>('agent');
   const [manualDone, setManualDone] = useState<Record<string, boolean>>({});
   const [blockingPlanId, setBlockingPlanId] = useState<string>('');
+  const [credsSent, setCredsSent] = useState(false);
 
   // Jam lokal untuk menghitung kedaluwarsa token (tanpa perlu refresh manual).
   React.useEffect(() => {
@@ -161,6 +162,7 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
       setSelfApprove(false);
       setManualDone({});
       setBlockingPlanId('');
+      setCredsSent(false);
       onShowToast('Plan remediasi ' + created.planId + ' dibuat (PLANNED, mode ' + executionMode + ').');
     } catch (err: any) {
       onShowToast(err?.message || 'Gagal membuat plan.', 'info');
@@ -194,6 +196,24 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
       const match = message.match(/PLAN-[0-9-]+/);
       if (match) setBlockingPlanId(match[0]);
       onShowToast(message, 'info');
+    } finally {
+      setIsBusy(false);
+    }
+  };
+
+  const handleSendCredentials = async () => {
+    if (!plan) return;
+    if (!apiKey.trim() && !hmacKey.trim()) {
+      onShowToast('Isi API key dan/atau HMAC key dulu.', 'info');
+      return;
+    }
+    setIsBusy(true);
+    try {
+      await sendAgentCredentials(plan.planId, { agentApiKey: apiKey, agentHmacKey: hmacKey });
+      setCredsSent(true);
+      onShowToast('Script dikirim ke tab Endpoint untuk host ini. Buka Endpoint Audit untuk mengunduh.');
+    } catch (err: any) {
+      onShowToast(err?.message || 'Gagal mengirim script ke endpoint.', 'info');
     } finally {
       setIsBusy(false);
     }
@@ -794,8 +814,20 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
                   />
                 </div>
                 <p className="text-[10px] font-mono text-slate-500">
-                  API/HMAC hanya disimpan di memori browser (tidak dikirim ke server saat mengetik); perintah di bawah menampilkan nilainya apa adanya.
+                  API/HMAC hanya disimpan di memori browser sampai dikirim; setelah tombol kirim, script tersedia di tab Endpoint.
                 </p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleSendCredentials}
+                    disabled={isBusy || !plan}
+                    className="px-3 py-1.5 rounded bg-emerald-700 hover:bg-emerald-600 text-white text-[11px] font-mono font-bold disabled:opacity-50"
+                  >
+                    SIMPAN &amp; KIRIM SCRIPT KE ENDPOINT
+                  </button>
+                  {credsSent && <span className="text-[11px] font-mono text-emerald-300">✓ terkirim — host dapat mengunduh di tab Endpoint</span>}
+                  {plan && !plan.artifacts && <span className="text-[11px] font-mono text-amber-300">plan lama tanpa artefak: buat plan baru.</span>}
+                </div>
                 <pre className="text-[11px] font-mono text-rose-300 overflow-auto max-h-40 leading-relaxed whitespace-pre-wrap">{cmdText || 'Approve plan untuk mendapatkan perintah…'}</pre>
                 <p className="text-[11px] font-mono text-slate-500">
                   Jalankan di host target. Agent mengambil plan langsung dari server — target hanya butuh <code>pasopati_remediate.py</code> + <code>pasopati_audit.py</code>.

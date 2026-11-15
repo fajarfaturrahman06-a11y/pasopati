@@ -173,8 +173,8 @@ Tanpa `--push-url`, hasil hanya tersimpan lokal di `audit.json` dan bisa diungga
 2. Opsional ikat ke host ter-enrol.
 3. Jika plan menyentuh SSH/firewall/RDP: siapkan konsol/KVM lalu centang konfirmasi.
 4. **BUAT PLAN** → **APPROVE PLAN** (operator lain; jika Anda pembuatnya centang “setujui sendiri”).
-5. Isi **API key** dan **HMAC key** di panel perintah **sebelum** approve; nilai ini ikut disimpan pada plan agar host bisa mengunduh script siap pakai.
-6. Token tampil **sekali** dan berlaku 10 menit. Salin `plan.json`/perintah sekarang.
+5. Isi **API key** dan **HMAC key** lalu klik **SIMPAN & KIRIM SCRIPT KE ENDPOINT**. Script langsung muncul di tab **Endpoint Audit** untuk host tersebut (masih menunggu approve sebelum bisa diunduh).
+6. Approve plan. Token tampil **sekali** dan berlaku 10 menit.
 7. Jika host masih punya plan aktif, panel menampilkan plan penghalang: selesaikan/rollback, atau **APPROVE PAKSA**.
 
 ### 7.4 Jalankan di host

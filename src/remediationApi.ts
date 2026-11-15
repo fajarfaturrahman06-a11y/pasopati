@@ -60,6 +60,14 @@ export async function approvePlan(
   return postJson('/api/remediation-approve', { planId, acknowledgeConsole, selfApprove, force, ...credentials });
 }
 
+/** Simpan kredensial agent dan tandai script siap dikirim ke tab endpoint. */
+export async function sendAgentCredentials(
+  planId: string,
+  credentials: { agentApiKey?: string; agentHmacKey?: string }
+): Promise<{ agentCredentialsReady: boolean }> {
+  return postJson('/api/remediation-plans/' + encodeURIComponent(planId) + '/agent-credentials', credentials);
+}
+
 export interface WhoAmI {
   name: string;
   role: string;

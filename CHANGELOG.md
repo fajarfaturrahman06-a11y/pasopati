@@ -1,5 +1,14 @@
 # Changelog
 
+## Tombol simpan & kirim script — 15 Nov 2026
+
+### Ditambah
+- Tombol **SIMPAN & KIRIM SCRIPT KE ENDPOINT** setelah admin mengisi API key/HMAC.
+  Kredensial disimpan pada artefak plan dan plan ditandai `agentCredentialsReady`.
+- Tab **Endpoint Audit** langsung menampilkan entri plan terkirim; tautan unduhan aktif
+  setelah plan di-approve. Izin: planner/approver untuk mengirim.
+- Audit log mencatat pengiriman script beserta `planId`.
+
 ## Unduhan script siap pakai untuk host — 15 Nov 2026
 
 ### Ditambah

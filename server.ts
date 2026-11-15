@@ -1453,6 +1453,8 @@ interface Plan {
   executionMode?: PlanExecutionMode;
   artifacts?: { generatedAt: string; hardeningHash: string; rollbackHash: string };
   manualEvidenceAt?: string;
+  /** Admin sudah menyimpan kredensial agent dan “mengirim” script ke tab endpoint. */
+  agentCredentialsReady?: boolean;
   approvedBy?: string;
   approvedAt?: string;
   nonce?: string;
@@ -2226,6 +2228,46 @@ app.get('/api/remediation-plans/:planId/run-script', requireRole('viewer', 'exec
   res.setHeader('X-Pasopati-Plan-Status', plan.status);
   res.setHeader('Content-Disposition', `attachment; filename="pasopati-${plan.planId}.${shell}"`);
   return res.send(bodyText);
+});
+
+app.post('/api/remediation-plans/:planId/agent-credentials', requireRole('planner', 'approver'), rateLimit(30, 'plan-credentials'), (req, res) => {
+  const plan = plansStore.get(String(req.params.planId || ''));
+  if (!plan) return res.status(404).json({ status: 'rejected', reason: 'Plan tidak ditemukan.' });
+  if (!plan.artifacts) return res.status(409).json({ status: 'rejected', reason: 'Plan ini belum punya artefak runbook; buat plan baru.' });
+  const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, any>;
+  const apiKey = typeof body.agentApiKey === 'string' ? body.agentApiKey.trim().slice(0, 200) : '';
+  const hmacKey = typeof body.agentHmacKey === 'string' ? body.agentHmacKey.trim().slice(0, 200) : '';
+  if (!apiKey && !hmacKey) return res.status(400).json({ status: 'rejected', reason: 'Isi minimal salah satu kredensial.' });
+  try {
+    savePlanCredentials(plan.planId, apiKey, hmacKey);
+  } catch (err) {
+    console.error('[PASOPATI] Gagal menyimpan kredensial plan:', (err as Error).message);
+    return res.status(500).json({ status: 'rejected', reason: 'Kredensial gagal disimpan.' });
+  }
+  plan.agentCredentialsReady = true;
+  plan.updatedAt = new Date().toISOString();
+  plansStore.set(plan.planId, plan);
+  savePlans(plansStore);
+  try {
+    appendAuditLogs([{
+      id: `LOG-CRED-${plan.planId}-${Date.now()}`,
+      timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
+      deviceId: plan.deviceId,
+      deviceName: plan.deviceId,
+      deviceRole: 'Endpoint',
+      action: 'BASELINE RECON',
+      operator: endpointActor(req),
+      preScore: 0,
+      postScore: 0,
+      changesSummary: `Script hardening ${plan.planId} dikirim ke tab Endpoint (kredensial tersimpan).`,
+      changesDetails: [`Plan: ${plan.planId}`, `Status: ${plan.status}`],
+      status: 'SUCCESS',
+      storedInDb: true
+    }], true);
+  } catch (err) {
+    console.error('[PASOPATI] Audit pengiriman script gagal:', (err as Error).message);
+  }
+  return res.json({ status: 'success', planId: plan.planId, agentCredentialsReady: true });
 });
 
 // plan.json lengkap (berisi token) untuk eksekusi offline.

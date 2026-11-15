@@ -40,8 +40,8 @@ export const TabDeepAudit: React.FC<TabDeepAuditProps> = ({
       .then(r => (r.ok ? r.json() : null))
       .then(d => {
         if (cancelled || !Array.isArray(d?.plans)) return;
-        const found = d.plans.find((p: any) => p.deviceId === deviceIdForPlans &&
-          (p.status === 'APPROVED' || p.status === 'EXECUTING') &&
+        const found = d.plans.find((p: any) => p.deviceId === deviceIdForPlans && p.agentCredentialsReady &&
+          (p.status === 'PLANNED' || p.status === 'APPROVED' || p.status === 'EXECUTING') &&
           (!p.evidenceDeadline || Date.now() < p.evidenceDeadline));
         setRunnablePlan(found ? { planId: found.planId, status: found.status } : null);
       })
@@ -311,9 +311,15 @@ export const TabDeepAudit: React.FC<TabDeepAuditProps> = ({
             </span>
           </div>
           <div className="mt-2 flex flex-wrap gap-2">
-            <a href={`/api/remediation-plans/${encodeURIComponent(runnablePlan.planId)}/run-script?shell=ps1`} className="px-2.5 py-1 rounded bg-emerald-800/60 border border-emerald-600 text-emerald-100 hover:bg-emerald-700/60">unduh .ps1</a>
-            <a href={`/api/remediation-plans/${encodeURIComponent(runnablePlan.planId)}/run-script?shell=sh`} className="px-2.5 py-1 rounded bg-emerald-800/60 border border-emerald-600 text-emerald-100 hover:bg-emerald-700/60">unduh .sh</a>
-            <a href={`/api/remediation-plans/${encodeURIComponent(runnablePlan.planId)}/plan-json`} className="px-2.5 py-1 rounded bg-slate-900 border border-slate-700 text-slate-200 hover:bg-slate-800">unduh plan.json</a>
+            {runnablePlan.status !== 'PLANNED' ? (
+              <>
+                <a href={`/api/remediation-plans/${encodeURIComponent(runnablePlan.planId)}/run-script?shell=ps1`} className="px-2.5 py-1 rounded bg-emerald-800/60 border border-emerald-600 text-emerald-100 hover:bg-emerald-700/60">unduh .ps1</a>
+                <a href={`/api/remediation-plans/${encodeURIComponent(runnablePlan.planId)}/run-script?shell=sh`} className="px-2.5 py-1 rounded bg-emerald-800/60 border border-emerald-600 text-emerald-100 hover:bg-emerald-700/60">unduh .sh</a>
+                <a href={`/api/remediation-plans/${encodeURIComponent(runnablePlan.planId)}/plan-json`} className="px-2.5 py-1 rounded bg-slate-900 border border-slate-700 text-slate-200 hover:bg-slate-800">unduh plan.json</a>
+              </>
+            ) : (
+              <span className="text-emerald-200/80">Script sudah dikirim; menunggu approve agar dapat diunduh dan dijalankan.</span>
+            )}
           </div>
           <div className="mt-1 text-[10px] text-emerald-200/70">Jalankan sebagai Administrator/root. Script memakai --no-exec; hapus flag itu untuk eksekusi nyata.</div>
         </div>
