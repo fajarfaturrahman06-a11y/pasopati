@@ -234,13 +234,12 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
         <div>
           <div className="flex items-center gap-2">
             <h3 className="text-lg font-bold tracking-tight text-rose-400 font-mono">
-              2. CHANGE SET, RUNBOOK & EKSEKUSI TERVERIFIKASI — {currentDevice?.name}
+              2. PAKET EKSEKUSI &amp; PERSETUJUAN — {currentDevice?.name}
             </h3>
             <VerificationBadge planStatus={plan ? plan.status : undefined} />
           </div>
           <p className="text-xs sm:text-sm text-slate-400 mt-1">
-            Satu jalur: pilih perubahan (enforce + advisory) → tinjau runbook yang dihasilkan → setujui → agent eksekusi dengan bukti & rollback.
-            Tanpa token valid, agent tetap read-only.
+            Satu alur dalam satu panel: pilih perubahan → tinjau runbook → buat plan → setujui → eksekusi. Tanpa token valid, agent tetap read-only.
           </p>
         </div>
       </div>
@@ -250,7 +249,7 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
           <div className="flex items-center gap-2">
             <ListChecks className="w-4 h-4 text-rose-400" />
             <h3 className="text-sm font-bold font-mono text-slate-200 uppercase tracking-wider">
-              2a. Pilih perubahan (parameter diturunkan dari temuan hardening)
+              Langkah 1 · Pilih perubahan (parameter diturunkan dari temuan hardening)
             </h3>
           </div>
           <span className="text-xs font-mono text-slate-400">
@@ -336,7 +335,7 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
           <div className="p-2.5 bg-slate-900 border-b border-slate-800 flex items-center justify-between flex-wrap gap-2">
             <span className="text-xs font-mono font-semibold text-rose-400 flex items-center gap-1.5">
               <FileJson className="w-3.5 h-3.5" />
-              {plan ? `2b. Runbook resmi plan ${plan.planId}` : '2b. Pratinjau runbook — belum tercatat'}
+              {plan ? `Langkah 2 · Runbook resmi plan ${plan.planId}` : 'Langkah 2 · Pratinjau runbook — belum tercatat'}
               {!plan && <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 text-slate-400">PRATINJAU</span>}
             </span>
             <div className="flex items-center gap-2">
@@ -412,7 +411,7 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
 
         <div className="flex items-center gap-2 pt-1 flex-wrap">
           <ShieldCheck className="w-4 h-4 text-rose-400" />
-          <span className="text-xs font-mono font-bold text-slate-200 uppercase tracking-wider">2c. Setujui &amp; eksekusi</span>
+          <span className="text-xs font-mono font-bold text-slate-200 uppercase tracking-wider">Langkah 3 · Setujui &amp; eksekusi</span>
           {whoami && (
             <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-300">
               operator: {whoami.name} · {whoami.role}
