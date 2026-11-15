@@ -64,8 +64,23 @@ function writeJsonAtomic(filePath: string, value: unknown) {
   const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   const tmp = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(value, null, 2), { encoding: 'utf-8', mode: 0o600 });
-  fs.renameSync(tmp, filePath);
+  const descriptor = fs.openSync(tmp, 'wx', 0o600);
+  try {
+    fs.writeFileSync(descriptor, JSON.stringify(value, null, 2), { encoding: 'utf-8' });
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  try {
+    fs.renameSync(tmp, filePath);
+  } catch (error) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* preserve rename error */ }
+    throw error;
+  }
+  try {
+    const dirDescriptor = fs.openSync(dir, 'r');
+    try { fs.fsyncSync(dirDescriptor); } finally { fs.closeSync(dirDescriptor); }
+  } catch { /* metadata direktori tidak selalu bisa di-fsync */ }
 }
 
 app.use(express.json({
@@ -555,6 +570,23 @@ function endpointRecords(): EndpointRecord[] {
   return readEndpointRecords(ENDPOINTS_PATH);
 }
 
+/**
+ * Tempelkan waiver aktif ke salinan record saat dibaca. Waiver tetap satu sumber
+ * (waivers.json); status tidak pernah ikut ditulis ke endpoint_inventory.json,
+ * sehingga polling 5 detik tidak menghapus WAIVED.
+ */
+function withActiveWaivers(record: EndpointRecord): EndpointRecord {
+  const active = activeWaivers(record.id);
+  if (active.length === 0) return record;
+  return {
+    ...record,
+    checks: (record.checks || []).map(check => {
+      const waiver = active.find(item => item.parameter === check.parameter);
+      return waiver ? { ...check, status: 'WAIVED' as const, waiver } : check;
+    })
+  };
+}
+
 function endpointBodyTooLarge(req: Request, res: Response): boolean {
   const raw = (req as Request & { rawBody?: Buffer }).rawBody;
   if (raw && raw.length > MAX_ENDPOINT_BODY_BYTES) {
@@ -660,6 +692,7 @@ function addEndpointChange(record: EndpointRecord, action: EndpointRecord['chang
 }
 
 function saveEndpointAudit(record: EndpointRecord, action: string, actor: string, summary: string) {
+  // Strict: file audit korup harus menggagalkan operasi, bukan diam-diam di-seal ulang.
   appendAuditLogs([{
     id: `ENDPOINT-${record.id}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
     timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
@@ -674,7 +707,31 @@ function saveEndpointAudit(record: EndpointRecord, action: string, actor: string
     changesDetails: [`Endpoint ID: ${record.id}`, `Hostname: ${record.hostname}`],
     status: 'SUCCESS',
     storedInDb: true
-  }]);
+  }], true);
+}
+
+/** Kembalikan registry ke kondisi sebelum perubahan ketika audit gagal ditulis. */
+function restoreEndpointRecords(previous: EndpointRecord[]): boolean {
+  try {
+    writeEndpointRecords(ENDPOINTS_PATH, previous);
+    return true;
+  } catch (err) {
+    console.error('[PASOPATI] Gagal memulihkan registry setelah audit gagal:', (err as Error).message);
+    return false;
+  }
+}
+
+function endpointAuditFailure(res: Response, previous: EndpointRecord[], auditError: unknown) {
+  const restored = restoreEndpointRecords(previous);
+  const detail = auditError instanceof Error ? auditError.message : 'tidak diketahui';
+  console.error('[PASOPATI] Audit endpoint gagal:', detail);
+  return res.status(500).json({
+    status: 'rejected',
+    reason: restored
+      ? 'Audit log tidak dapat ditulis; perubahan endpoint dibatalkan agar riwayat tetap utuh.'
+      : 'Audit log tidak dapat ditulis dan pemulihan registry juga gagal; periksa data secara manual.',
+    auditError: detail
+  });
 }
 
 function containsControlCharacter(value: string): boolean {
@@ -730,11 +787,22 @@ function normalizeAgentTelemetry(payload: unknown, headerUnit: string | undefine
   });
   const rawPorts = device.ports_list ?? [];
   if (!Array.isArray(rawPorts) || rawPorts.length > 512) throw new Error('device_info.ports_list harus array dengan maksimal 512 port.');
+  // Identitas mesin stabil (UUID dari agen). tactical_unit hanya nama; agen lama
+  // tanpa machine_id tetap memakai unit agar kompatibel.
+  const rawMachineId = metadata.machine_id ?? body.machine_id;
+  let agentIdentity = unit;
+  if (rawMachineId !== undefined && rawMachineId !== null && String(rawMachineId).trim() !== '') {
+    const machineId = String(rawMachineId).trim();
+    if (!/^[A-Za-z0-9._:-]{8,128}$/.test(machineId)) {
+      throw new Error('metadata.machine_id harus 8–128 karakter (huruf, angka, titik, garis bawah, titik dua, tanda hubung).');
+    }
+    agentIdentity = machineId;
+  }
   const platformText = `${String(device.platform_type || '')} ${String(device.os || '')}`.toLowerCase();
   const platformType = platformText.includes('windows') ? 'windows' : (platformText.includes('embedded') || platformText.includes('openwrt') ? 'embedded' : 'linux');
   const receivedAt = new Date();
   const endpoint = normalizeEndpointInput({
-    agentId: unit,
+    agentId: agentIdentity,
     name: unit,
     hostname: typeof device.hostname === 'string' && device.hostname.trim() ? device.hostname.trim() : unit,
     role: typeof metadata.device_role === 'string' ? metadata.device_role : `Endpoint (${String(device.platform_type || 'telemetri agen')})`,
@@ -757,9 +825,10 @@ function upsertAgentEndpoint(payload: unknown, headerUnit: string | undefined, e
   const incoming = normalizeAgentTelemetry(payload, headerUnit);
   const explicitRole = Boolean((payload as any)?.metadata?.device_role);
   const records = endpointRecords();
+  const previousRecords = records.map(record => record);
   const existing = findEndpointByIdentity(records, incoming.endpoint);
   const duplicate = Boolean(existing?.telemetryEventIds?.includes(eventId));
-  if (duplicate && existing) return { ...incoming, record: existing, created: false, duplicate: true };
+  if (duplicate && existing) return { ...incoming, record: existing, created: false, duplicate: true, previousRecords };
   const previousHistory = existing?.history || [];
   const record: EndpointRecord = {
     ...(existing || {} as EndpointRecord),
@@ -783,7 +852,7 @@ function upsertAgentEndpoint(payload: unknown, headerUnit: string | undefined, e
   if (existing) records[records.findIndex(item => item.id === existing.id)] = record;
   else records.push(record);
   writeEndpointRecords(ENDPOINTS_PATH, records);
-  return { ...incoming, record, created: !existing, duplicate: false };
+  return { ...incoming, record, created: !existing, duplicate: false, previousRecords };
 }
 
 app.get('/api/endpoints', requireApiKey, rateLimit(120, 'endpoints-read'), (_req, res) => {
@@ -792,7 +861,7 @@ app.get('/api/endpoints', requireApiKey, rateLimit(120, 'endpoints-read'), (_req
       .map(endpoint => {
         const quarantine = [endpoint.id, endpoint.agentId, endpoint.name].filter(Boolean)
           .map(key => quarantineRegistry.get(String(key))).find(Boolean);
-        return { ...endpoint, isQuarantined: quarantine ? quarantine.quarantined : endpoint.isQuarantined };
+        return withActiveWaivers({ ...endpoint, isQuarantined: quarantine ? quarantine.quarantined : endpoint.isQuarantined });
       })
       .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
     return res.json({ endpoints, total: endpoints.length, updatedAt: new Date().toISOString() });
@@ -806,7 +875,7 @@ app.get('/api/endpoints/:id', requireApiKey, rateLimit(120, 'endpoint-read'), (r
   try {
     const endpoint = endpointRecords().find(item => item.id === req.params.id && !item.deletedAt);
     if (!endpoint) return res.status(404).json({ status: 'rejected', reason: 'Endpoint tidak ditemukan.' });
-    return res.json({ endpoint });
+    return res.json({ endpoint: withActiveWaivers(endpoint) });
   } catch (err) {
     console.error('[PASOPATI] Penyimpanan endpoint gagal dibaca:', (err as Error).message);
     return res.status(500).json({ status: 'rejected', reason: 'Penyimpanan endpoint tidak dapat dibaca.' });
@@ -818,13 +887,26 @@ app.post('/api/endpoints', requireRole('planner', 'viewer'), rateLimit(30, 'endp
   try {
     const input = normalizeEndpointInput(req.body);
     const records = endpointRecords();
+    const previous = records.map(record => record);
     const existing = findEndpointByIdentity(records, input);
+    const ifMatch = String(req.get('If-Match') || '').replace(/^"|"$/g, '');
+    const rawExpected = req.body?.expected_revision ?? (ifMatch ? Number(ifMatch) : undefined);
+    let currentRevision = 1;
+    if (existing) {
+      currentRevision = Number.isSafeInteger(existing.revision) && existing.revision > 0 ? existing.revision : 1;
+      if (!Number.isSafeInteger(rawExpected) || Number(rawExpected) < 1) {
+        return res.status(428).json({ status: 'rejected', reason: 'Endpoint sudah ada; expected_revision wajib diisi agar tidak menimpa perubahan lain.', current_revision: currentRevision, endpoint: withActiveWaivers(existing) });
+      }
+      if (Number(rawExpected) !== currentRevision) {
+        return res.status(409).json({ status: 'conflict', reason: 'Endpoint berubah sejak browser terakhir memuatnya. Data terbaru dikirim untuk mencegah lost update.', current_revision: currentRevision, endpoint: withActiveWaivers(existing) });
+      }
+    }
     const now = new Date().toISOString();
     const actor = endpointActor(req);
     const record: EndpointRecord = existing ? {
       ...existing, ...input, id: existing.id, source: existing.source,
       createdAt: existing.createdAt, updatedAt: now, created_at: existing.created_at || existing.createdAt,
-      updated_at: now, revision: (existing.revision || 1) + 1, changeHistory: existing.changeHistory || [],
+      updated_at: now, revision: currentRevision + 1, changeHistory: existing.changeHistory || [],
       history: input.history?.length ? input.history : existing.history,
       isQuarantined: existing.isQuarantined
     } : {
@@ -839,7 +921,11 @@ app.post('/api/endpoints', requireRole('planner', 'viewer'), rateLimit(30, 'endp
     if (existing) records[records.findIndex(item => item.id === existing.id)] = record;
     else records.push(record);
     writeEndpointRecords(ENDPOINTS_PATH, records);
-    saveEndpointAudit(record, existing ? 'ENDPOINT UPDATE' : 'ENDPOINT CREATE', actor, record.name);
+    try {
+      saveEndpointAudit(record, existing ? 'ENDPOINT UPDATE' : 'ENDPOINT CREATE', actor, record.name);
+    } catch (auditError) {
+      return endpointAuditFailure(res, previous, auditError);
+    }
     return res.status(existing ? 200 : 201).json({ status: 'success', created: !existing, endpoint: record });
   } catch (err) {
     const message = (err as Error).message;
@@ -853,6 +939,7 @@ app.put('/api/endpoints/:id', requireRole('planner', 'viewer'), rateLimit(30, 'e
   if (endpointBodyTooLarge(req, res)) return;
   try {
     const records = endpointRecords();
+    const previous = records.map(record => record);
     const index = records.findIndex(item => item.id === req.params.id && !item.deletedAt);
     if (index < 0) return res.status(404).json({ status: 'rejected', reason: 'Endpoint tidak ditemukan.' });
     const patch = normalizeEndpointInput(req.body, true);
@@ -864,7 +951,7 @@ app.put('/api/endpoints/:id', requireRole('planner', 'viewer'), rateLimit(30, 'e
       return res.status(428).json({ status: 'rejected', reason: 'expected_revision wajib diisi; muat versi endpoint terbaru sebelum menyimpan.' });
     }
     if (Number(expectedRevision) !== currentRevision) {
-      return res.status(409).json({ status: 'conflict', reason: 'Endpoint berubah sejak browser terakhir memuatnya. Data terbaru dikirim untuk mencegah lost update.', current_revision: currentRevision, endpoint: current });
+      return res.status(409).json({ status: 'conflict', reason: 'Endpoint berubah sejak browser terakhir memuatnya. Data terbaru dikirim untuk mencegah lost update.', current_revision: currentRevision, endpoint: withActiveWaivers(current) });
     }
     const now = new Date().toISOString();
     const merged: EndpointRecord = { ...current, ...patch, id: current.id, source: current.source, createdAt: current.createdAt, updatedAt: now, created_at: current.created_at || current.createdAt, updated_at: now, revision: currentRevision + 1 };
@@ -875,7 +962,11 @@ app.put('/api/endpoints/:id', requireRole('planner', 'viewer'), rateLimit(30, 'e
     addEndpointChange(merged, 'UPDATE', endpointActor(req), 'operator', 'Endpoint diperbarui melalui API.');
     records[index] = merged;
     writeEndpointRecords(ENDPOINTS_PATH, records);
-    saveEndpointAudit(merged, 'ENDPOINT UPDATE', endpointActor(req), merged.name);
+    try {
+      saveEndpointAudit(merged, 'ENDPOINT UPDATE', endpointActor(req), merged.name);
+    } catch (auditError) {
+      return endpointAuditFailure(res, previous, auditError);
+    }
     return res.json({ status: 'success', endpoint: merged });
   } catch (err) {
     const message = (err as Error).message;
@@ -888,6 +979,7 @@ app.put('/api/endpoints/:id', requireRole('planner', 'viewer'), rateLimit(30, 'e
 app.delete('/api/endpoints/:id', requireRole('admin'), rateLimit(20, 'endpoint-delete'), (req, res) => {
   try {
     const records = endpointRecords();
+    const previous = records.map(record => record);
     const endpoint = records.find(item => item.id === req.params.id && !item.deletedAt);
     if (!endpoint) return res.status(404).json({ status: 'rejected', reason: 'Endpoint tidak ditemukan.' });
     const actor = endpointActor(req);
@@ -898,7 +990,11 @@ app.delete('/api/endpoints/:id', requireRole('admin'), rateLimit(20, 'endpoint-d
     endpoint.revision = (endpoint.revision || 1) + 1;
     addEndpointChange(endpoint, 'DELETE', actor, 'operator', 'Endpoint diarsipkan (soft delete).');
     writeEndpointRecords(ENDPOINTS_PATH, records);
-    saveEndpointAudit(endpoint, 'ENDPOINT DELETE', actor, endpoint.name);
+    try {
+      saveEndpointAudit(endpoint, 'ENDPOINT DELETE', actor, endpoint.name);
+    } catch (auditError) {
+      return endpointAuditFailure(res, previous, auditError);
+    }
     return res.json({ status: 'success', deleted: true, id: endpoint.id, deletedAt: now });
   } catch (err) {
     console.error('[PASOPATI] Gagal menghapus endpoint:', (err as Error).message);
@@ -962,7 +1058,23 @@ app.post('/api/ingest', rateLimit(60, 'ingest'), (req, res) => {
       status: 'SUCCESS',
       storedInDb: true
     };
-    const totalLogs = appendAuditLogs([ingestEntry], true);
+    let totalLogs: number;
+    try {
+      totalLogs = appendAuditLogs([ingestEntry], true);
+    } catch (auditError) {
+      // Endpoint sudah tertulis; kembalikan registry agar audit dan registry
+      // tidak berbeda. Signature belum dicatat sehingga retry tetap boleh.
+      const restored = restoreEndpointRecords(stored.previousRecords);
+      const detail = auditError instanceof Error ? auditError.message : 'tidak diketahui';
+      console.error('[PUSKODAL-INGEST] Audit gagal:', detail);
+      return res.status(500).json({
+        status: 'rejected',
+        reason: restored
+          ? 'Audit log tidak dapat ditulis; telemetri dibatalkan agar registry dan audit tetap konsisten. Kirim ulang.'
+          : 'Audit log gagal ditulis dan pemulihan registry gagal; periksa data manual.',
+        auditError: detail
+      });
+    }
     recordIngestSignature(auth.signature);
     console.log(`[PUSKODAL-INGEST] Telemetri dari: ${unit} | Endpoint: ${record.id} | Score: ${score}/100 | HMAC: valid`);
     return res.json({
@@ -1242,7 +1354,26 @@ const waiversStore: WaiverRecord[] = readJsonArray<WaiverRecord>(WAIVERS_PATH);
 function saveWaivers() {
   try { writeJsonAtomic(WAIVERS_PATH, waiversStore); } catch (err) {
     console.error('[PASOPATI] Gagal menulis waivers:', (err as Error).message);
+    throw err;
   }
+}
+
+function saveWaiverAudit(action: string, waiver: WaiverRecord, actor: string) {
+  appendAuditLogs([{
+    id: `WAIVER-${waiver.id}-${crypto.randomBytes(3).toString('hex')}`,
+    timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
+    deviceId: waiver.deviceId,
+    deviceName: waiver.deviceId,
+    deviceRole: 'Endpoint',
+    action: 'BASELINE RECON',
+    operator: actor,
+    preScore: 0,
+    postScore: 0,
+    changesSummary: `${action}: ${waiver.parameter} (${waiver.id}) — ${waiver.reason}`.slice(0, 300),
+    changesDetails: [`Waiver ${waiver.id}`, `Parameter: ${waiver.parameter}`, `Berlaku s/d ${waiver.expiresAt}`],
+    status: 'SUCCESS',
+    storedInDb: true
+  }], true);
 }
 
 function activeWaivers(deviceId: string) {
@@ -1280,15 +1411,33 @@ app.post('/api/waivers', requireRole('planner'), (req, res) => {
     expiresAt: new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString()
   };
   waiversStore.push(waiver);
-  saveWaivers();
+  try {
+    saveWaivers();
+    saveWaiverAudit('WAIVER CREATE', waiver, principal.name);
+  } catch (err) {
+    const index = waiversStore.findIndex(item => item.id === waiver.id);
+    if (index >= 0) waiversStore.splice(index, 1);
+    try { saveWaivers(); } catch { /* pertahankan error asli */ }
+    console.error('[PASOPATI] Gagal menyimpan waiver:', (err as Error).message);
+    return res.status(500).json({ status: 'rejected', reason: 'Waiver tidak dapat disimpan permanen atau audit gagal ditulis.' });
+  }
   return res.json({ status: 'success', waiver });
 });
 
 app.delete('/api/waivers/:deviceId/:id', requireRole('approver'), (req, res) => {
   const index = waiversStore.findIndex(w => w.deviceId === String(req.params.deviceId || '') && w.id === String(req.params.id || ''));
   if (index === -1) return res.status(404).json({ status: 'rejected', reason: 'Waiver tidak ditemukan.' });
+  const principal = (req as Request & { principal?: Principal }).principal as Principal;
   const [removed] = waiversStore.splice(index, 1);
-  saveWaivers();
+  try {
+    saveWaivers();
+    saveWaiverAudit('WAIVER REMOVE', removed, principal.name);
+  } catch (err) {
+    waiversStore.splice(index, 0, removed);
+    try { saveWaivers(); } catch { /* pertahankan error asli */ }
+    console.error('[PASOPATI] Gagal menghapus waiver:', (err as Error).message);
+    return res.status(500).json({ status: 'rejected', reason: 'Waiver tidak dapat dihapus permanen atau audit gagal ditulis.' });
+  }
   return res.json({ status: 'success', waiver: removed });
 });
 
@@ -2459,6 +2608,10 @@ function acquireDataLock() {
 
 async function startServer() {
   const isDev = process.env.NODE_ENV !== 'production';
+  console.log(`[PASOPATI] DATA_DIR: ${DATA_DIR}${process.env.PASOPATI_DATA_DIR ? ' (PASOPATI_DATA_DIR)' : ' (default: cwd/data)'}`);
+  if (!process.env.PASOPATI_DATA_DIR && /[\\/]system32$/i.test(process.cwd())) {
+    console.warn('[PASOPATI] cwd berada di System32; set PASOPATI_DATA_DIR eksplisit agar registry tidak tersebar.');
+  }
   acquireDataLock();
 
   if (isDev) {

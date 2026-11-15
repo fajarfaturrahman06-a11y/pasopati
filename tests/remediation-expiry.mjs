@@ -112,7 +112,7 @@ try {
     const freshNonce = await req(port, 'POST', '/api/remediation-verify', { planId, nonce: newNonce, toStatus: 'VERIFIED', evidence, postAudit });
     check('Nonce baru diterima', freshNonce.status === 200, `status=${freshNonce.status}`);
     server.kill('SIGKILL');
-    fs.rmSync(dataDir, { recursive: true, force: true });
+    fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 
   // ---- B. batas evidence pendek: verify setelah batas harus 401 ----
@@ -124,7 +124,7 @@ try {
     const late = await req(port, 'POST', '/api/remediation-verify', { planId, nonce, toStatus: 'VERIFIED', evidence });
     check('Verify setelah batas evidence ditolak 401', late.status === 401, `status=${late.status}`);
     server.kill('SIGKILL');
-    fs.rmSync(dataDir, { recursive: true, force: true });
+    fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 } catch (err) {
   check('Uji expiry selesai tanpa exception', false, err?.message || String(err));

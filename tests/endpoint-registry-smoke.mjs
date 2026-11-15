@@ -83,11 +83,11 @@ async function request(method, endpoint, { body, key = API_KEY, headers = {} } =
   return { status: response.status, data };
 }
 
-function sign(rawBody, timestamp) {
+function sign(rawBody, timestamp, unit = 'AGENT-SMOKE-1') {
   return {
     'X-Pasopati-Signature': crypto.createHmac('sha256', HMAC_SECRET).update(rawBody).digest('hex'),
     'X-Pasopati-Timestamp': String(timestamp),
-    'X-Pasopati-Unit': 'AGENT-SMOKE-1'
+    'X-Pasopati-Unit': unit
   };
 }
 
@@ -132,11 +132,28 @@ try {
   const viewer = await request('POST', '/api/operators', { body: { name: 'endpoint-smoke-viewer', role: 'viewer' } });
   const viewerKey = viewer.data?.key;
   const viewerRead = await request('GET', '/api/endpoints', { key: viewerKey });
-  const viewerCreate = await request('POST', '/api/endpoints', { key: viewerKey, body: { name: 'Forbidden', hostname: 'forbidden.example' } });
+  const viewerCreateBody = { name: 'Viewer Endpoint', hostname: 'viewer.example', ip: '192.0.2.11' };
+  const viewerCreate = await request('POST', '/api/endpoints', { key: viewerKey, body: viewerCreateBody });
+  const viewerRevision = viewerCreate.data?.endpoint?.revision;
+  const viewerUpdate = await request('PUT', `/api/endpoints/${viewerCreate.data?.endpoint?.id}`, {
+    key: viewerKey, body: { role: 'Workstation viewer', expected_revision: viewerRevision }
+  });
   const viewerDelete = await request('DELETE', `/api/endpoints/${endpointId}`, { key: viewerKey });
-  check('RBAC viewer dapat membaca, tetapi tidak dapat menambah atau mengarsipkan endpoint',
-    Boolean(viewerKey) && viewerRead.status === 200 && viewerCreate.status === 403 && viewerDelete.status === 403,
-    `read=${viewerRead.status}, create=${viewerCreate.status}, delete=${viewerDelete.status}`);
+  check('RBAC viewer: baca + tambah + ubah endpoint, tetapi tidak boleh menghapus',
+    Boolean(viewerKey) && viewerRead.status === 200 && viewerCreate.status === 201 && viewerUpdate.status === 200 &&
+      viewerUpdate.data?.endpoint?.revision === Number(viewerRevision) + 1 && viewerDelete.status === 403,
+    `read=${viewerRead.status}, create=${viewerCreate.status}, update=${viewerUpdate.status}, delete=${viewerDelete.status}`);
+
+  const viewerEndpointId = viewerCreate.data?.endpoint?.id;
+  const upsertWithoutRevision = await request('POST', '/api/endpoints', { body: { ...viewerCreateBody, name: 'Tanpa revisi' } });
+  const staleRevision = await request('POST', '/api/endpoints', { body: { ...viewerCreateBody, name: 'Revisi basi', expected_revision: viewerRevision } });
+  const currentViewerRevision = viewerUpdate.data?.endpoint?.revision;
+  const upsertWithRevision = await request('POST', '/api/endpoints', { body: { ...viewerCreateBody, name: 'Upsert aman', expected_revision: currentViewerRevision } });
+  check('POST pada identitas yang sudah ada wajib expected_revision (428/409) dan menaikkan revision',
+    upsertWithoutRevision.status === 428 && staleRevision.status === 409 &&
+      upsertWithRevision.status === 200 && upsertWithRevision.data?.endpoint?.revision === Number(currentViewerRevision) + 1 &&
+      upsertWithRevision.data?.endpoint?.id === viewerEndpointId,
+    `tanpa=${upsertWithoutRevision.status}, basi=${staleRevision.status}, benar=${upsertWithRevision.status}`);
 
   const clientBRead = await request('GET', '/api/endpoints');
   const fromB = clientBRead.data?.endpoints?.find(item => item.id === endpointId);
@@ -159,7 +176,10 @@ try {
   const duplicateIds = duplicates.map(result => result.data?.endpoint?.id);
   let list = await request('GET', '/api/endpoints');
   const shared = list.data?.endpoints?.filter(item => item.hostname === concurrentBody.hostname) || [];
-  check('Dua POST bersamaan untuk identitas sama menghasilkan satu endpoint', duplicateIds[0] && duplicateIds[0] === duplicateIds[1] && shared.length === 1);
+  const duplicateStatuses = duplicates.map(result => result.status).sort();
+  check('Dua POST bersamaan untuk identitas sama menghasilkan satu endpoint (satu 201, satu 428)',
+    duplicateIds[0] && duplicateIds[0] === duplicateIds[1] && shared.length === 1 &&
+      duplicateStatuses[0] === 201 && duplicateStatuses[1] === 428, `status=${duplicateStatuses.join(',')}`);
 
   const uniqueConcurrent = await Promise.all([
     request('POST', '/api/endpoints', { body: { name: 'Concurrent 1', hostname: 'concurrent-1.example' } }),
@@ -193,8 +213,42 @@ try {
   check('Agen HMAC meng-upsert endpoint yang sama berdasarkan MAC', telemetryResponse.status === 200 && ingestedEndpointId === endpointId && ingestedEndpoint?.ip === '192.0.2.10');
   check('Compliance matrix dan score tersimpan di registry endpoint', ingestedEndpoint?.checks?.[0]?.parameter === 'Firewall aktif' && ingestedEndpoint?.history?.at(-1)?.score === 77);
 
-  const beforeRestartLogs = await request('GET', '/api/audit-logs');
-  const logsBefore = beforeRestartLogs.data?.logs?.length || 0;
+  // Dua mesin berbeda dengan tactical_unit sama harus tetap dua endpoint.
+  const twinTelemetry = (machineId, mac) => ({
+    metadata: { tactical_unit: 'SAME-UNIT', machine_id: machineId, standard_baseline: 'CIS v8' },
+    device_info: { hostname: `same-unit-${machineId}.example`, os: 'Linux', platform_type: 'Linux Server', primary_ip: '192.0.2.70', mac_address: mac, ports_list: [22] },
+    scoring: { cyber_readiness_score: 60, passed_checks: 1, warning_checks: 0, failed_checks: 1, total_checks: 2 },
+    compliance_matrix: [{ parameter: 'SSH', category: 'Access Control', status: 'FAIL', details: 'x' }]
+  });
+  for (const [machineId, mac] of [['11111111-1111-4111-8111-111111111111', 'aa:bb:cc:dd:ee:71'], ['22222222-2222-4222-8222-222222222222', 'aa:bb:cc:dd:ee:72']]) {
+    const raw = JSON.stringify(twinTelemetry(machineId, mac));
+    const response = await fetch(`${BASE}/api/ingest`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...sign(raw, Math.floor(Date.now() / 1000), 'SAME-UNIT') },
+      body: raw
+    });
+    check(`Telemetri mesin ${machineId.slice(0, 8)} diterima`, response.status === 200, `HTTP ${response.status}`);
+  }
+  list = await request('GET', '/api/endpoints');
+  const twins = list.data?.endpoints?.filter(item => item.hostname?.startsWith('same-unit-')) || [];
+  check('Dua mesin dengan tactical_unit sama tetap menjadi dua endpoint (machine_id stabil)',
+    twins.length === 2 && twins.every(item => Boolean(item.agentId)) && new Set(twins.map(item => item.agentId)).size === 2,
+    `jumlah=${twins.length}`);
+
+  // Waiver dikelola server: harus muncul di GET dan tercatat di audit.
+  const planner = await request('POST', '/api/operators', { body: { name: 'endpoint-smoke-planner', role: 'planner' } });
+  const waiverCreate = await request('POST', '/api/waivers', {
+    key: planner.data?.key,
+    body: { deviceId: endpointId, parameter: 'Firewall aktif', reason: 'Uji waiver registry', days: 5 }
+  });
+  const waiverList = await request('GET', '/api/endpoints');
+  const waiverCheck = waiverList.data?.endpoints?.find(item => item.id === endpointId)?.checks?.find(check => check.parameter === 'Firewall aktif');
+  const waiverLogs = await request('GET', '/api/audit-logs');
+  check('Waiver persist di GET dan tercatat di audit trail',
+    waiverCreate.status === 200 && waiverCheck?.status === 'WAIVED' && Boolean(waiverCheck?.waiver) &&
+      (waiverLogs.data?.logs || []).some(log => String(log.changesSummary || '').includes('WAIVER CREATE')),
+    `create=${waiverCreate.status}, status=${waiverCheck?.status}`);
+
   const inventoryPath = path.join(dataDir, 'endpoint_inventory.json');
   check('File registry permanen dibuat di DATA_DIR', fs.existsSync(inventoryPath));
   await stopServer();
@@ -204,8 +258,29 @@ try {
   const afterRestart = await request('GET', '/api/endpoints');
   const persisted = afterRestart.data?.endpoints?.find(item => item.id === endpointId);
   check('Data endpoint tetap ada sesudah restart backend', Boolean(persisted) && persisted.name === 'Laptop A — updated' && persisted.history?.at(-1)?.score === 77);
+  const waiverAfterRestart = await request('GET', `/api/endpoints/${endpointId}`);
+  check('Waiver tetap ada setelah refresh/restart', waiverAfterRestart.data?.endpoint?.checks?.some(item => item.status === 'WAIVED') === true);
+
+  // Audit korup: operasi tulis harus gagal jelas dan registry dikembalikan.
+  const auditPath = path.join(dataDir, 'audit_logs.json');
+  const auditBackup = fs.readFileSync(auditPath);
+  const inventoryBeforeCorrupt = fs.readFileSync(inventoryPath, 'utf-8');
+  fs.writeFileSync(auditPath, '{ audit rusak', 'utf-8');
+  const corruptWrite = await request('POST', '/api/endpoints', { body: { name: 'Saat audit korup', hostname: 'korup.example' } });
+  const inventoryAfterCorrupt = fs.readFileSync(inventoryPath, 'utf-8');
+  check('Audit korup menggagalkan tulis dengan 500 dan registry dipulihkan',
+    corruptWrite.status === 500 && !inventoryAfterCorrupt.includes('korup.example') && inventoryAfterCorrupt === inventoryBeforeCorrupt,
+    `HTTP ${corruptWrite.status}`);
+  fs.writeFileSync(auditPath, auditBackup);
+  const repairedWrite = await request('POST', '/api/endpoints', { body: { name: 'Setelah audit diperbaiki', hostname: 'pulih.example' } });
+  check('Tulis berhasil lagi setelah audit diperbaiki', repairedWrite.status === 201, `HTTP ${repairedWrite.status}`);
+  const chainAfterRepair = await request('GET', '/api/audit-logs');
+  check('Rantai audit tetap valid setelah operasi dan pemulihan', chainAfterRepair.data?.chainOk === true);
 
   // Replay request identical setelah restart tidak menambah point history/log baru.
+  const endpointBeforeReplay = await request('GET', `/api/endpoints/${endpointId}`);
+  const revisionBeforeReplay = endpointBeforeReplay.data?.endpoint?.revision;
+  const logsBeforeReplay = (await request('GET', '/api/audit-logs')).data?.logs?.length || 0;
   const replayResponse = await fetch(`${BASE}/api/ingest`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...telemetryHeaders },
@@ -214,7 +289,7 @@ try {
   const afterReplayList = await request('GET', '/api/endpoints');
   const afterReplayEndpoint = afterReplayList.data?.endpoints?.find(item => item.id === endpointId);
   const afterReplayLogs = await request('GET', '/api/audit-logs');
-  check('Replay lintas restart idempotent untuk endpoint, revision, dan audit', replayResponse.status === 200 && afterReplayEndpoint?.history?.length === 1 && afterReplayEndpoint?.revision === persisted?.revision && (afterReplayLogs.data?.logs?.length || 0) === logsBefore);
+  check('Replay lintas restart idempotent untuk endpoint, revision, dan audit', replayResponse.status === 200 && afterReplayEndpoint?.history?.length === 1 && afterReplayEndpoint?.revision === revisionBeforeReplay && (afterReplayLogs.data?.logs?.length || 0) === logsBeforeReplay);
 
   const removed = await request('DELETE', `/api/endpoints/${endpointId}`);
   const detailAfterDelete = await request('GET', `/api/endpoints/${endpointId}`);

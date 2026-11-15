@@ -143,7 +143,7 @@ Untuk mempermudah pengujian oleh Dewan Juri, repositori ini membagi sistem ke da
 Tidak ada lagi satu kunci bersama untuk semua pihak. Modelnya:
 
 - **Login dashboard:** akun username/password admin di-bootstrap dari `PASOPATI_ADMIN_USERNAME` dan `PASOPATI_ADMIN_PASSWORD` pada `.env` lokal. Password di-hash scrypt di `data/auth.sqlite`; browser hanya menerima cookie sesi `HttpOnly`, `SameSite=Lax` selama 12 jam.
-- **Akun viewer dashboard:** admin membuat username/password melalui tombol **BUAT USER UJI**. Akun memiliki role `viewer`; semua izin tetap diperiksa di backend.
+- **Akun viewer dashboard:** admin membuat username/password melalui tombol **BUAT USER UJI**. Viewer dapat membaca dan menambah/mengubah endpoint (kebutuhan upload hasil audit) tetapi tidak dapat menghapus endpoint atau membuka Audit Log; semua izin tetap diperiksa di backend.
 - **API key dan operator lama:** `PASOPATI_API_KEY` serta akun `POST /api/operators {name, role}` tetap tersedia untuk integrasi API/agen, bukan untuk login UI. Kunci operator ditampilkan **sekali** dan hanya hash SHA-256 yang disimpan. Role API: `viewer` (baca) · `planner` (buat plan) · `approver` (approve) · `executor` (eksekusi/evidence/quarantine).
 - **Host** di-enrol: `POST /api/hosts/enroll {name}` → `hostId` + `hostKey`. Agent memakai header
   `X-Pasopati-Host-Key` (atau `--host-key` / `PASOPATI_HOST_KEY`). Plan bisa diikat ke `hostId`,

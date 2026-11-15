@@ -1205,6 +1205,7 @@ def run_full_audit(unit_name="PASOPATI-LOCAL-NODE"):
             "scanner": "PASOPATI Autonomous Deep Agent v2.7",
             "timestamp": timestamp,
             "tactical_unit": unit_name,
+            "machine_id": get_machine_id(),
             "standard_baseline": "CIS Benchmark v8.0, DISA STIG, ISA/IEC 62443 Deep Baseline",
             "audit_version": "2.7",
             "profile": {
@@ -2989,7 +2990,7 @@ def ensure_elevated(argv, entry_script=None):
 # ------------------------------------------------------------------------------
 # RIWAYAT EKSEKUSI (dibawa ke audit.json agar run berikutnya punya konteks)
 # ------------------------------------------------------------------------------
-def _history_path():
+def _state_folder():
     if platform.system().lower() == "windows":
         base = os.environ.get("PROGRAMDATA") if _is_elevated() else os.path.expanduser("~")
         folder = os.path.join(base or os.path.expanduser("~"), "PASOPATI")
@@ -3001,11 +3002,45 @@ def _history_path():
         with open(probe, "w") as f:
             f.write("ok")
         os.remove(probe)
-        return os.path.join(folder, "history.json")
+        return folder
     except Exception:
         fallback = os.path.join(os.path.expanduser("~"), ".pasopati")
         os.makedirs(fallback, mode=0o700, exist_ok=True)
-        return os.path.join(fallback, "history.json")
+        return fallback
+
+def _history_path():
+    return os.path.join(_state_folder(), "history.json")
+
+_MACHINE_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
+
+def get_machine_id():
+    """UUID mesin yang dibuat sekali dan dipakai ulang (identitas endpoint stabil).
+
+    Disimpan lokal dengan mode 0600. Nilai ini ikut di dalam payload yang
+    ditandatangani HMAC, jadi bukan sekadar klaim yang mudah dipalsukan.
+    """
+    path = os.path.join(_state_folder(), "machine-id")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            existing = f.read().strip()
+        if _MACHINE_ID_RE.match(existing):
+            return existing
+    except Exception:
+        pass
+    fresh = str(uuid.uuid4())
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(fresh)
+        try:
+            os.chmod(tmp, 0o600)
+        except Exception:
+            pass
+        os.replace(tmp, path)
+    except Exception:
+        pass
+    return fresh
 
 def read_history(path=None):
     path = path or _history_path()

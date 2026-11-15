@@ -38,8 +38,10 @@ Buka `http://localhost:3000`.
 1. Masuk dengan `PASOPATI_ADMIN_USERNAME` dan `PASOPATI_ADMIN_PASSWORD` yang dikonfigurasi di `.env` sebelum server pertama kali dijalankan.
 2. Di sidebar admin pilih **BUAT USER UJI**. Tentukan username serta password minimal 12 karakter untuk akun `viewer`.
 3. Catat kredensial viewer yang ditampilkan, lalu tutup panel dan pilih **KELUAR**.
-4. Masuk dengan akun viewer. Viewer hanya memiliki izin baca; permintaan yang membutuhkan role admin ditolak backend.
+4. Masuk dengan akun viewer. Viewer dapat membaca Dashboard/Endpoint Audit/Agent & Upload dan **menambah atau mengubah endpoint** (hasil upload/scan), tetapi tidak dapat menghapus endpoint, membuka Audit Log, atau mengelola hardening.
 5. Untuk kembali, keluar lalu masuk menggunakan akun admin.
+
+Endpoint pusat disimpan di `PASOPATI_DATA_DIR/endpoint_inventory.json`. Set `PASOPATI_DATA_DIR` eksplisit (mis. `C:\Apps\PASOPATI\data`) agar lokasi data tidak bergantung direktori kerja. Backup folder `data` sebelum rilis; jangan menyalin `data` dari staging.
 
 Password disimpan sebagai hash scrypt di `data/auth.sqlite`. Browser menerima cookie sesi `HttpOnly`, `SameSite=Lax` yang kedaluwarsa setelah 12 jam; password dan token sesi tidak disimpan di `localStorage`. API key/HMAC tetap digunakan oleh integrasi agen/backend lama, bukan sebagai login UI. Pengaturan env bootstrap hanya membuat akun saat pertama kali; mengubah env setelahnya tidak otomatis mengganti akun yang sudah tersimpan.
 

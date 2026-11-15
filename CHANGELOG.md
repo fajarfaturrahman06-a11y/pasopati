@@ -1,5 +1,53 @@
 # Changelog
 
+## Perbaikan registry pusat pasca-audit — 15 Nov 2026
+
+Pengerasan konsistensi data, integritas audit, dan kesiapan VPS. Tanpa perubahan
+framework dan tanpa deploy otomatis.
+
+### Diperbaiki
+- `POST /api/endpoints` pada identitas yang sudah ada kini **wajib** `expected_revision`
+  (`428` bila kosong, `409` bila basi) dan selalu menaikkan `revision`; tidak ada lagi
+  timpa-menimpa diam-diam.
+- Upload/scan dari UI memakai `PUT` + `expected_revision` bila endpoint sudah ada
+  (retry sekali setelah sinkron pada konflik). Endpoint baru memakai `POST`.
+- Waiver status kini dikelola backend dan ditempelkan pada `GET /api/endpoints` serta
+  `GET /api/endpoints/:id`, sehingga polling 5 detik tidak menghapus `WAIVED`.
+  Perubahan waiver ditulis ke audit trail secara strict.
+- Identitas agen memakai `metadata.machine_id` (UUID persisten di sisi agen), bukan
+  `tactical_unit`. Dua mesin dengan unit sama tetap menjadi dua endpoint. Agen lama
+  tanpa `machine_id` tetap kompatibel; migrasi terjadi saat identitas MAC/hostname cocok.
+- Audit log dibaca **strict** untuk operasi tulis endpoint/waiver. File audit korup
+  menggagalkan operasi dengan `500`, registry dikembalikan ke kondisi sebelumnya, dan
+  chain lama tidak di-seal ulang.
+- Ingest telemetri: registry ditulis → audit strict → signature dicatat. Jika audit gagal,
+  endpoint dipulihkan dan respons `500`; retry tidak menduplikasi record.
+- Penulisan registry memakai `fsync` file + best-effort `fsync` direktori sebelum/sesudah
+  rename atomik; kegagalan tulis tidak dianggap sukses.
+- UI upload menunggu konfirmasi server sebelum menampilkan hasil; ada indikator proses
+  dan error yang jelas. Jendela mock pada login dihapus; data mock tidak lagi menimpa
+  tampilan setelah sesi aktif.
+- `DATA_DIR` dicetak saat start; ada peringatan bila server berjalan dari `System32`
+  tanpa `PASOPATI_DATA_DIR`.
+
+### Ditambah
+- `deploy/check-vps-readonly.ps1` — pemeriksaan proses, port, task, DATA_DIR, dan registry
+  tanpa mengubah apa pun dan tanpa mencetak secret.
+- `deploy/start-pasopati.example.ps1` — contoh supervisor dengan `Set-Location` dan
+  `PASOPATI_DATA_DIR` eksplisit (task yang ada tetap dipakai).
+- Regression test: wajib revisi pada POST upsert, waiver persist + audit, dua mesin dengan
+  unit sama, audit korup + pemulihan, operasi sah/tidak sah per role.
+
+### Diubah
+- Izin tulis endpoint: `viewer` boleh `POST`/`PUT` (kebutuhan upload hasil audit),
+  `DELETE` tetap `admin`, waiver `planner`, karantina `executor`. Rasional dan risiko
+  dicatat di `IMPLEMENTATION-REPORT.md`.
+
+### Kompatibilitas
+- File JSON lama dimigrasikan otomatis saat dibaca (tanpa menghapus data). Endpoint lama
+  tanpa `machine_id` tetap ada dan dicocokkan lewat MAC/hostname; tidak digabung hanya
+  karena `tactical_unit` sama.
+
 ## v2.9.6 — 14 Nov 2026
 
 Perbaikan dari uji lapangan Batch D kelima: volume terenkripsi tapi tidak bisa

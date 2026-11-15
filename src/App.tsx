@@ -92,6 +92,20 @@ export default function App() {
   const toastTimerRef = useRef<number | null>(null);
   const endpointSyncRef = useRef<() => Promise<void>>(async () => undefined);
   const centralEndpointDataRef = useRef(false);
+  const devicesRef = useRef<DeviceInfo[]>([]);
+
+  useEffect(() => { devicesRef.current = devices; }, [devices]);
+
+  /** Tunggu sinkronisasi registry pertama; hindari upload menimpa state mock. */
+  const waitForRegistry = async (timeoutMs = 8000) => {
+    const startedAt = Date.now();
+    while (!centralEndpointDataRef.current) {
+      if (Date.now() - startedAt > timeoutMs) {
+        throw new Error('Registry pusat belum tersinkron. Periksa koneksi ke server lalu coba lagi.');
+      }
+      await new Promise<void>(resolve => { window.setTimeout(resolve, 200); });
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -208,6 +222,9 @@ export default function App() {
     }
 
     setEndpointSyncStatus('connecting');
+    // Jangan tampilkan mock sebagai inventaris saat sesi aktif; kosongkan hanya
+    // bila belum pernah tersambung agar upload tidak "menimpa" data contoh.
+    if (!centralEndpointDataRef.current) setDevices([]);
     const sync = async () => {
       if (cancelled || inFlight) return;
       inFlight = true;
@@ -401,9 +418,11 @@ export default function App() {
   };
 
   const saveEndpoint = async (payload: EndpointDraftPayload, id?: string, expectedRevision?: number) => {
-    if (!sessionActive || !centralEndpointDataRef.current) throw new Error('Sesi login atau koneksi registry VPS tidak tersedia.');
+    if (!sessionActive) throw new Error('Sesi login tidak tersedia.');
+    await waitForRegistry();
     const response = await fetch(id ? `/api/endpoints/${encodeURIComponent(id)}` : '/api/endpoints', {
       method: id ? 'PUT' : 'POST',
+      credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(id ? { ...payload, expected_revision: expectedRevision } : payload)
     });
@@ -419,7 +438,8 @@ export default function App() {
   };
 
   const deleteEndpoint = async (id: string) => {
-    if (!sessionActive || !centralEndpointDataRef.current) throw new Error('Koneksi registry VPS tidak tersedia.');
+    if (!sessionActive) throw new Error('Sesi login tidak tersedia.');
+    await waitForRegistry();
     const response = await fetch(`/api/endpoints/${encodeURIComponent(id)}`, {
       method: 'DELETE', credentials: 'same-origin'
     });
@@ -432,7 +452,7 @@ export default function App() {
   // Sample stays local/demo; operational scan or JSON upload must be saved at VPS.
   const handleAddUploadedDevice = async (newDevice: DeviceInfo, source: 'agent' | 'demo' = 'agent') => {
     if (source === 'demo') {
-      if (centralEndpointDataRef.current) {
+      if (centralEndpointDataRef.current || sessionActive) {
         showToast('Contoh demo tidak ditambahkan ke inventaris VPS.', 'info');
         return;
       }
@@ -441,20 +461,58 @@ export default function App() {
       showToast(`Contoh ${newDevice.name} hanya dimuat dalam sesi demo.`, 'info');
       return;
     }
-    if (!sessionActive || !centralEndpointDataRef.current) throw new Error('Sesi login dan koneksi registry VPS diperlukan untuk menyimpan ke VPS.');
-    const response = await fetch('/api/endpoints', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...newDevice, agentId: newDevice.agentId || newDevice.id, source: undefined })
-    });
-    const result = await response.json().catch(() => null);
-    if (!response.ok) throw new Error(String(result?.reason || `HTTP ${response.status}`));
-    await endpointSyncRef.current();
-    if (result?.endpoint?.id) {
-      setSelectedDeviceId(String(result.endpoint.id));
-      void refreshWaivers(String(result.endpoint.id));
+    if (!sessionActive) throw new Error('Sesi login diperlukan untuk menyimpan ke registry.');
+    await waitForRegistry();
+    try {
+    const identity = newDevice.agentId || newDevice.id;
+    const body = { ...newDevice, agentId: identity, source: undefined };
+
+    const send = async () => {
+      const existing = devicesRef.current.find(device =>
+        (identity && device.agentId === identity) ||
+        (newDevice.hostname && device.hostname === newDevice.hostname) ||
+        (newDevice.mac && newDevice.mac !== '00:00:00:00:00:00' && device.mac === newDevice.mac)
+      );
+      const response = await fetch(existing ? `/api/endpoints/${encodeURIComponent(existing.id)}` : '/api/endpoints', {
+        method: existing ? 'PUT' : 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(existing ? { ...body, expected_revision: existing.revision || 1 } : body)
+      });
+      return { response, existing };
+    };
+
+    let result = await send();
+    let data = await result.response.json().catch(() => null);
+    // Telemetri upload selalu lebih baru; pada konflik, pakai endpoint+revision dari
+    // server lalu ulangi sekali sebagai PUT (hindari 428/409 berantai).
+    if (result.response.status === 409 && data?.endpoint?.id) {
+      const conflict = data.endpoint;
+      const retry = await fetch(`/api/endpoints/${encodeURIComponent(conflict.id)}`, {
+        method: 'PUT',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...body, expected_revision: conflict.revision })
+      });
+      result = { response: retry, existing: conflict };
+      data = await retry.json().catch(() => null);
     }
-    showToast(`Hasil audit ${newDevice.name} tersimpan di registry VPS (upload/import, bukan bukti scan langsung).`, 'info');
+    if (!result.response.ok) throw new Error(String(data?.reason || `HTTP ${result.response.status}`));
+    await endpointSyncRef.current();
+    if (data?.endpoint?.id) {
+      setSelectedDeviceId(String(data.endpoint.id));
+      void refreshWaivers(String(data.endpoint.id));
+    }
+    showToast(
+      result.existing
+        ? `Hasil audit ${newDevice.name} memperbarui endpoint yang sudah ada (revision ${data?.endpoint?.revision || '—'}).`
+        : `Hasil audit ${newDevice.name} tersimpan sebagai endpoint baru.`,
+      'info'
+    );
+    } catch (err) {
+      void endpointSyncRef.current();
+      throw err;
+    }
   };
 
   // Build official military commander briefing report text

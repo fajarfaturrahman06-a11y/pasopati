@@ -12,15 +12,21 @@ Sekarang VPS menjadi sumber data endpoint: backend menyimpan registry permanen s
 
 Registry disimpan di `DATA_DIR/endpoint_inventory.json` (pada instalasi yang menggunakan nilai default, `C:\Apps\PASOPATI\data\endpoint_inventory.json`). Tidak ada database pada arsitektur ini, jadi JSON dipertahankan. Setiap rekam punya UUID stabil, `created_at`, `updated_at`, `revision`, history compliance dan history perubahan; file lama dinormalisasi saat dibaca. Identitas dideduplikasi berdasarkan ID agen serta MAC/hostname yang layak.
 
-Penulisan mengganti file melalui atomic rename. Lock startup sekarang memakai pembuatan file eksklusif; proses kedua yang memakai direktori data sama ditolak dan kegagalan lock menghentikan startup, bukan dibiarkan berjalan tanpa perlindungan. PUT mengirim `expected_revision`; jika perangkat berubah sejak browser membaca datanya, API mengembalikan `409` alih-alih menimpa perubahan terbaru. UI menyegarkan data dan meminta operator membuka ulang formulir edit.
+Penulisan mengganti file melalui atomic rename dengan `fsync` file dan best-effort `fsync` direktori. Lock startup sekarang memakai pembuatan file eksklusif; proses kedua yang memakai direktori data sama ditolak dan kegagalan lock menghentikan startup, bukan dibiarkan berjalan tanpa perlindungan. PUT **dan POST upsert** mewajibkan `expected_revision` (`428` bila kosong, `409` bila basi); UI menyegarkan data dan meminta operator membuka ulang formulir edit.
 
 ### API dan keamanan
 
-Ditambahkan `GET /api/endpoints`, `GET /api/endpoints/:id`, `POST /api/endpoints`, `PUT /api/endpoints/:id`, dan `DELETE /api/endpoints/:id`. Semuanya memakai auth yang sudah ada; POST/PUT memerlukan planner/admin, DELETE admin. DELETE berupa arsip lunak, sehingga item tidak lagi tampil di registry aktif namun rekam dan history tetap tersimpan. Input, alamat IP/MAC, port, status checks, panjang teks, jumlah item dan ukuran payload divalidasi. Kegagalan baca/tulis dilaporkan sebagai error; tidak ada API publik tanpa autentikasi.
+Ditambahkan `GET /api/endpoints`, `GET /api/endpoints/:id`, `POST /api/endpoints`, `PUT /api/endpoints/:id`, dan `DELETE /api/endpoints/:id`. Semuanya memakai auth sesi/API key yang sudah ada. **POST/PUT: viewer, planner, admin** (viewer perlu menulis karena upload hasil audit di tab Agent & Upload); **DELETE: admin**. Risiko memberi viewer hak tulis: viewer dapat mengubah inventaris, tetapi tetap tidak dapat mengarsipkan dan seluruh perubahan masuk audit. DELETE berupa arsip lunak, sehingga item tidak lagi tampil di registry aktif namun rekam dan history tetap tersimpan. Input, alamat IP/MAC, port, status checks, panjang teks, jumlah item dan ukuran payload divalidasi. Kegagalan baca/tulis dilaporkan sebagai error; tidak ada API publik tanpa autentikasi.
+
+### Waiver
+
+Waiver tetap satu sumber (`waivers.json`) dan ditempelkan oleh server pada `GET /api/endpoints`/`:id`, sehingga polling tidak menghapus status `WAIVED`. Pembuatan/penghapusan waiver ditulis ke audit trail secara strict dan dibatalkan bila audit gagal.
 
 ### Agen dan sinkronisasi
 
-`/api/ingest` tetap memakai autentikasi HMAC yang lama agar kompatibel dengan agen. Payload penuh (hostname, OS, IP, MAC, pengguna, port, matrix compliance dan scoring) di-upsert ke endpoint yang sama, lalu masuk audit log. ID event stabil dari signature disimpan untuk mencegah replay menghasilkan history ganda, termasuk setelah backend restart. Jika penyimpanan endpoint gagal, ingest tidak menyatakan sukses.
+`/api/ingest` tetap memakai autentikasi HMAC yang lama agar kompatibel dengan agen. **Identitas mesin** diambil dari `metadata.machine_id` (UUID persisten yang dibuat agen sekali di `~/.pasopati/machine-id` atau `/var/lib/pasopati/machine-id`), sehingga dua mesin dengan `tactical_unit` sama tetap dua endpoint. `tactical_unit` hanya menjadi nama. Agen lama tanpa `machine_id` tetap memakai unit sebagai identitas; record lama dicocokkan lewat MAC/hostname dan tidak digabung hanya karena unit sama.
+
+Payload penuh (hostname, OS, IP, MAC, pengguna, port, matrix compliance dan scoring) di-upsert ke endpoint yang sama, lalu masuk audit log. Urutannya: registry ditulis → audit strict → signature dicatat. Jika audit gagal, registry dikembalikan dan ingest menjawab `500`; signature belum dicatat sehingga retry tidak menduplikasi record. ID event stabil dari signature mencegah replay menghasilkan history ganda, termasuk setelah restart. `machine_id` berada di dalam body yang ditandatangani HMAC sehingga tidak dapat dipalsukan lewat payload biasa.
 
 Setelah autentikasi, seluruh halaman memakai registry VPS; polling dibatasi satu request aktif tiap lima detik, menampilkan status koneksi dan waktu sinkronisasi, serta mencoba pulih otomatis setelah offline. Tanpa autentikasi aplikasi menampilkan mode demo, bukan mengklaim fixture sebagai inventaris operasional. Upload/scan agen disimpan ke registry; tombol sampel tetap lokal/demo.
 
@@ -35,7 +41,9 @@ Setelah autentikasi, seluruh halaman memakai registry VPS; polling dibatasi satu
 - `src/components/TabDeepAudit.tsx`, `src/components/TabAIHardening.tsx` — empty-state aman saat registry belum berisi endpoint.
 - `package.json` — menambahkan integration test ke `npm test`.
 - `package-lock.json` — menyelaraskan versi app ke 2.9.6 dan mengganti `jiti@2.8.3` yang tidak tersedia dengan `2.7.0` yang memenuhi rentang `^2.7.0`.
-- `tests/endpoint-registry-smoke.mjs` — integration test API registry, concurrent writes, konflik stale, restart, HMAC dan RBAC.
+- `tests/endpoint-registry-smoke.mjs` — integration test API registry, wajib revisi POST/PUT, waiver, machine_id, audit korup, concurrent writes, restart, HMAC dan RBAC.
+- `pasopati_audit.py` — UUID mesin persisten (`--` tidak perlu) yang ikut di payload bertanda tangan.
+- `deploy/check-vps-readonly.ps1`, `deploy/start-pasopati.example.ps1` — pemeriksaan VPS read-only dan contoh supervisor.
 - `tests/control-plane-smoke.mjs` — assertion ingest diperbarui sesuai ID endpoint stabil.
 - `DEPLOYMENT-VPS-WINDOWS-SERVER-2022.md` — prosedur backup, staging, restart task yang ada, verifikasi dan rollback.
 - `IMPLEMENTATION-REPORT.md` — laporan ini.

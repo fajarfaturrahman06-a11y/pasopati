@@ -151,10 +151,19 @@ try {
   check('Audit Akses & Kondisi Endpoint tetap admin-only', viewerAudit.response.status === 403, `HTTP ${viewerAudit.response.status}`);
   const viewerWrite = await request('POST', '/api/endpoints', {
     cookie: viewer.cookie,
-    body: { name: 'auth-viewer-write-denied', hostname: 'auth-viewer.local', platformType: 'linux', checks: [] },
+    body: { name: 'auth-viewer-write', hostname: 'auth-viewer.local', platformType: 'linux', checks: [] },
     headers: { Origin: BASE }
   });
-  check('Viewer tidak dapat menambah endpoint (RBAC server)', viewerWrite.response.status === 403, `HTTP ${viewerWrite.response.status}`);
+  check('Viewer dapat menambah endpoint (kebutuhan upload hasil audit)', viewerWrite.response.status === 201, `HTTP ${viewerWrite.response.status}`);
+  const viewerEndpointId = viewerWrite.data?.endpoint?.id;
+  const viewerUpdate = await request('PUT', `/api/endpoints/${viewerEndpointId}`, {
+    cookie: viewer.cookie,
+    body: { role: 'viewer-updated', expected_revision: viewerWrite.data?.endpoint?.revision },
+    headers: { Origin: BASE }
+  });
+  const viewerDelete = await request('DELETE', `/api/endpoints/${viewerEndpointId}`, { cookie: viewer.cookie, headers: { Origin: BASE } });
+  check('Viewer dapat mengubah tetapi tidak menghapus endpoint', viewerUpdate.response.status === 200 && viewerDelete.response.status === 403,
+    `update=${viewerUpdate.response.status}, delete=${viewerDelete.response.status}`);
 
   const auditAdmin = await request('GET', '/api/admin/endpoint-health-audit', { cookie: admin.cookie });
   check('Audit endpoint terpisah masih dapat dibuka oleh admin', auditAdmin.response.status === 200, `HTTP ${auditAdmin.response.status}`);

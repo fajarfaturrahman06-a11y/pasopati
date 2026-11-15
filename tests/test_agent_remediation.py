@@ -951,5 +951,42 @@ class QuarantineTests(unittest.TestCase):
             agent.platform.system, agent.subprocess.run = orig
 
 
+class MachineIdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pasopati-machine-id-")
+        self.orig_state = agent._state_folder
+        agent._state_folder = lambda: self.tmp
+
+    def tearDown(self):
+        agent._state_folder = self.orig_state
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_machine_id_stabil_dan_tersimpan(self):
+        first = agent.get_machine_id()
+        second = agent.get_machine_id()
+        self.assertEqual(first, second)
+        self.assertRegex(first, r"^[A-Za-z0-9._:-]{8,128}$")
+        with open(os.path.join(self.tmp, "machine-id"), "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read().strip(), first)
+
+    def test_machine_id_berbeda_antar_folder_state(self):
+        first = agent.get_machine_id()
+        other = tempfile.mkdtemp(prefix="pasopati-machine-id-2-")
+        try:
+            agent._state_folder = lambda: other
+            self.assertNotEqual(first, agent.get_machine_id())
+        finally:
+            import shutil
+            shutil.rmtree(other, ignore_errors=True)
+
+    def test_machine_id_dibuat_ulang_bila_file_rusak(self):
+        with open(os.path.join(self.tmp, "machine-id"), "w", encoding="utf-8") as handle:
+            handle.write("rusak!")
+        fresh = agent.get_machine_id()
+        self.assertRegex(fresh, r"^[A-Za-z0-9._:-]{8,128}$")
+        self.assertNotEqual(fresh, "rusak!")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

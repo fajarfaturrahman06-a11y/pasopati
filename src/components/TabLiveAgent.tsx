@@ -18,6 +18,7 @@ export const TabLiveAgent: React.FC<TabLiveAgentProps> = ({
 }) => {
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [uploadedResult, setUploadedResult] = useState<AuditAgentResult | null>(null);
+  const [savingResult, setSavingResult] = useState(false);
   const [isScanningHost, setIsScanningHost] = useState(false);
 
   // Live real scan of current server container
@@ -110,7 +111,8 @@ export const TabLiveAgent: React.FC<TabLiveAgentProps> = ({
 
   // Process and ingest into session devices
   const processAuditData = async (json: AuditAgentResult, source: 'agent' | 'demo' = 'agent') => {
-    setUploadedResult(json);
+    setUploadError(null);
+    setSavingResult(true);
     const rawUnitName = String(json.metadata?.tactical_unit || 'UPLOADED-JURI-NODE');
     const unitName = /^[A-Z0-9][A-Z0-9-_]{0,31}$/.test(rawUnitName.toUpperCase()) ? rawUnitName.toUpperCase() : 'UPLOADED-JURI-NODE';
     const deviceInfo = json.device_info || ({} as any);
@@ -144,8 +146,16 @@ export const TabLiveAgent: React.FC<TabLiveAgentProps> = ({
       })
     };
 
-    await onAddUploadedDevice(newDevice, source);
-    sfx.playSuccess();
+    try {
+      await onAddUploadedDevice(newDevice, source);
+      setUploadedResult(json);
+      sfx.playSuccess();
+    } catch (err: any) {
+      setUploadedResult(null);
+      setUploadError(err?.message || 'Gagal menyimpan endpoint ke registry pusat.');
+    } finally {
+      setSavingResult(false);
+    }
   };
 
   // 1-Click Sample Preloader for jury convenience
@@ -358,8 +368,15 @@ export const TabLiveAgent: React.FC<TabLiveAgentProps> = ({
               />
             </label>
 
+            {savingResult && (
+              <div className="mt-3 p-3 rounded bg-sky-950/60 border border-sky-800 text-sky-200 text-xs font-mono flex items-center gap-2" role="status">
+                <Server className="w-4 h-4 text-sky-300 shrink-0 animate-pulse" />
+                <span>Menyimpan ke registry pusat… endpoint belum ditampilkan sampai server mengonfirmasi.</span>
+              </div>
+            )}
+
             {uploadError && (
-              <div className="mt-3 p-3 rounded bg-rose-950/60 border border-rose-800 text-rose-300 text-xs font-mono flex items-center gap-2">
+              <div className="mt-3 p-3 rounded bg-rose-950/60 border border-rose-800 text-rose-300 text-xs font-mono flex items-center gap-2" role="alert">
                 <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
                 <span>{uploadError}</span>
               </div>
@@ -380,7 +397,7 @@ export const TabLiveAgent: React.FC<TabLiveAgentProps> = ({
                 Ingin uji langsung tanpa terminal? Klik tombol di bawah untuk mengeksekusi <code>pasopati_audit.py</code> secara nyata pada mesin server ini sekarang!
               </p>
               <button
-                disabled={isScanningHost}
+                disabled={isScanningHost || savingResult}
                 onClick={handleLiveHostScan}
                 className="w-full py-2.5 px-3 rounded bg-rose-600 hover:bg-rose-500 text-white text-xs font-mono font-bold transition-all shadow-[0_0_15px_rgba(239,68,68,0.3)] flex items-center justify-center gap-2 disabled:opacity-50"
               >

@@ -98,16 +98,72 @@ Jika konfigurasi task tidak bisa menghentikan child `node.exe` dengan bersih, ja
 
 ## 4. Verifikasi API dan dua browser
 
-Lakukan verifikasi hanya melalui HTTPS yang sertifikatnya valid. Buka PASOPATI dari dua browser dengan akun yang sudah berwenang. Masukkan API key lewat UI yang tersedia; jangan menaruhnya di URL atau terminal. Pastikan panel Registri Endpoint menunjukkan **TERHUBUNG · DATA VPS** dan waktu sync berubah. Dari Browser A tambahkan endpoint; Browser B seharusnya menampilkan data maksimal sekitar 5 detik. Ubah endpoint dari Browser B dan pastikan Browser A melihat nilai baru. Uji juga endpoint yang sama dikirim dua kali; jumlah endpoint tidak boleh bertambah.
+Lakukan verifikasi hanya melalui HTTPS yang sertifikatnya valid. Buka PASOPATI dari dua browser lalu login dengan akun berwenang (sesi cookie; API key hanya untuk integrasi agen, bukan login UI). Pastikan panel Registri Endpoint menunjukkan **TERHUBUNG · DATA VPS** dan waktu sync berubah. Dari Browser A tambahkan endpoint; Browser B seharusnya menampilkan data maksimal sekitar 5 detik. Ubah endpoint dari Browser B dan pastikan Browser A melihat nilai baru. Uji juga endpoint yang sama dikirim dua kali; jumlah endpoint tidak boleh bertambah.
 
 Endpoint API yang diharapkan:
 
 - `GET /api/endpoints` dan `GET /api/endpoints/:id`: role autentikasi yang diizinkan.
-- `POST /api/endpoints` dan `PUT /api/endpoints/:id`: role planner/admin. PUT wajib mengirim `expected_revision` dari record yang terakhir dibaca; jika sudah ada perubahan yang lebih baru, server menolak dengan `409` dan UI menyegarkan data agar perubahan tidak hilang.
+- `POST /api/endpoints` (baru atau upsert) dan `PUT /api/endpoints/:id`: role viewer/planner/admin. Bila identitas sudah ada, `expected_revision` wajib (`428` bila kosong); revisi basi ditolak `409` dan UI menyegarkan data agar perubahan tidak hilang. Setiap perubahan menaikkan `revision`.
 - `DELETE /api/endpoints/:id`: role admin; penghapusan berupa arsip lunak agar history tidak hilang.
 - `POST /api/ingest`: signature HMAC agen yang valid, lalu upsert endpoint dan telemetry.
 
 Tanpa autentikasi, daftar endpoint harus ditolak `401`. Payload invalid harus ditolak dengan status `400`; kegagalan persistensi tidak boleh dibalas sebagai telemetry tersimpan. Periksa kesehatan layanan dan log server sesuai prosedur operasi VPS yang berlaku, tanpa mengeluarkan nilai secret.
+
+## 4a. Direktori kerja dan DATA_DIR wajib eksplisit
+
+Supervisor yang sudah ada (`C:\Apps\PASOPATI\start-pasopati.ps1`) harus selalu melakukan `Set-Location 'C:\Apps\PASOPATI'` dan menetapkan:
+
+```powershell
+$env:PASOPATI_DATA_DIR = 'C:\Apps\PASOPATI\data'
+$env:NODE_ENV = 'production'
+$env:PORT = '3000'
+```
+
+Contoh ada di `deploy/start-pasopati.example.ps1`; jangan mengganti task action/trigger yang sudah berjalan. Server mencetak `DATA_DIR` saat start. Bila log menampilkan `...\System32\data`, hentikan task dan perbaiki direktori kerja sebelum meneruskan.
+
+Port 3001 hanya untuk pengujian. Sebelum deployment, pastikan tidak ada instance PASOPATI lain:
+
+```powershell
+Get-NetTCPConnection -State Listen | Where-Object LocalPort -in 3000,3001 |
+  Select-Object LocalPort, OwningProcess
+Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
+  Select-Object ProcessId, CommandLine
+```
+
+`.server.lock` hanya dihapus setelah PID di dalamnya dipastikan mati (cek `Get-Process -Id`).
+
+## 4b. Pemeriksaan VPS read-only
+
+Jalankan `deploy/check-vps-readonly.ps1` sebagai Administrator. Skrip ini hanya membaca: proses Node, port 3000/3001, Scheduled Task, `PASOPATI_DATA_DIR`, lokasi registry, ukuran/timestamp file, dan permission folder data. Tidak mencetak isi `.env`.
+
+## 4c. Backup dan restore data
+
+Registry dan audit adalah data operasional:
+
+```powershell
+# backup (sebelum perubahan)
+robocopy 'C:\Apps\PASOPATI\data' "C:\Backups\PASOPATI\$stamp\data" /E /COPY:DAT /R:2 /W:2
+icacls "C:\Backups\PASOPATI\$stamp" /inheritance:r /grant:r 'Administrators:(OI)(CI)F' 'SYSTEM:(OI)(CI)F'
+
+# restore (hanya saat data aktif rusak; hentikan task dulu)
+Stop-ScheduledTask -TaskName 'PASOPATI Auto Start'
+robocopy "C:\Backups\PASOPATI\$stamp\data" 'C:\Apps\PASOPATI\data' /E /COPY:DAT /R:2 /W:2
+Start-ScheduledTask -TaskName 'PASOPATI Auto Start'
+```
+
+Jangan menyalin `data` dari staging/arsip rilis; itu akan menimpa registry produksi. Simpan backup audit dan `endpoint_inventory.json` terpisah agar bisa diverifikasi.
+
+## 4d. Permission folder data
+
+```powershell
+icacls 'C:\Apps\PASOPATI\data' /inheritance:r /grant:r 'Administrators:(OI)(CI)F' 'SYSTEM:(OI)(CI)F'
+```
+
+Aplikasi berjalan sebagai SYSTEM lewat task; jangan memberi Everyone tulis.
+
+## 4e. HTTPS sebelum akses publik
+
+API key agen dan cookie sesi harus lewat TLS. Sebelum membuka port ke internet, pasang reverse proxy IIS dengan sertifikat valid ke `127.0.0.1:3000`, atau set `TLS_CERT`/`TLS_KEY`. HSTS baru berlaku efektif di atas HTTPS.
 
 ## 5. Rollback
 
