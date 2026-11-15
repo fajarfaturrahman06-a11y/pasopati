@@ -1199,7 +1199,7 @@ def run_full_audit(unit_name="PASOPATI-LOCAL-NODE"):
     fail_items = sum(1 for item in audit_matrix if item["status"] == "FAIL")
     na_items = sum(1 for item in audit_matrix if str(item.get("status", "")).upper() in ("N/A", "SKIPPED"))
     applicable_items = max(total_items - na_items, 1)
-    raw_score = int(((pass_items * 100) + (warn_items * 50)) / applicable_items)
+    raw_score = int(round(((pass_items * 100) + (warn_items * 50)) / applicable_items))
     
     audit_result = {
         "metadata": {
