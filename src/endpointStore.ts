@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { isIP } from 'node:net';
 import type { DeviceInfo, SecurityCheck } from './types';
+import { fsyncDirectorySync, renameWithRetrySync } from './atomicWrite';
 
 export interface EndpointChange {
   at: string;
@@ -189,22 +190,24 @@ export function writeEndpointRecords(filePath: string, records: EndpointRecord[]
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true });
   const tempPath = `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  let descriptor: number | undefined;
   try {
     // Tulis + fsync file sementara sebelum rename agar isi benar-benar sampai ke disk.
-    const descriptor = fs.openSync(tempPath, 'wx', 0o600);
+    descriptor = fs.openSync(tempPath, 'wx', 0o600);
     try {
       fs.writeFileSync(descriptor, JSON.stringify(records, null, 2), { encoding: 'utf-8' });
       fs.fsyncSync(descriptor);
     } finally {
       fs.closeSync(descriptor);
+      descriptor = undefined;
     }
-    fs.renameSync(tempPath, filePath);
-    // fsync direktori tidak didukung semua filesystem (Windows), jadi dibuat opsional.
-    try {
-      const dirDescriptor = fs.openSync(dir, 'r');
-      try { fs.fsyncSync(dirDescriptor); } finally { fs.closeSync(dirDescriptor); }
-    } catch { /* abaikan: metadata direktori tidak dapat di-fsync di platform ini */ }
+    // Windows dapat melempar EPERM/EACCES/EBUSY sementara; helper melakukan retry terbatas.
+    renameWithRetrySync(tempPath, filePath);
+    fsyncDirectorySync(dir);
   } catch (error) {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch { /* abaikan */ }
+    }
     try { fs.rmSync(tempPath, { force: true }); } catch { /* preserve the original write error */ }
     throw error;
   }

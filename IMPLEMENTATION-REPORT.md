@@ -12,7 +12,7 @@ Sekarang VPS menjadi sumber data endpoint: backend menyimpan registry permanen s
 
 Registry disimpan di `DATA_DIR/endpoint_inventory.json` (pada instalasi yang menggunakan nilai default, `C:\Apps\PASOPATI\data\endpoint_inventory.json`). Tidak ada database pada arsitektur ini, jadi JSON dipertahankan. Setiap rekam punya UUID stabil, `created_at`, `updated_at`, `revision`, history compliance dan history perubahan; file lama dinormalisasi saat dibaca. Identitas dideduplikasi berdasarkan ID agen serta MAC/hostname yang layak.
 
-Penulisan mengganti file melalui atomic rename dengan `fsync` file dan best-effort `fsync` direktori. Lock startup sekarang memakai pembuatan file eksklusif; proses kedua yang memakai direktori data sama ditolak dan kegagalan lock menghentikan startup, bukan dibiarkan berjalan tanpa perlindungan. PUT **dan POST upsert** mewajibkan `expected_revision` (`428` bila kosong, `409` bila basi); UI menyegarkan data dan meminta operator membuka ulang formulir edit.
+Penulisan mengganti file melalui atomic rename dengan `fsync` file dan best-effort `fsync` direktori. Rename memakai helper `src/atomicWrite.ts` dengan retry terbatas hanya untuk `EPERM`/`EACCES`/`EBUSY` (Windows antivirus/indexer), tanpa menghapus file tujuan dan tanpa fallback copy. Lock startup sekarang memakai pembuatan file eksklusif; proses kedua yang memakai direktori data sama ditolak dan kegagalan lock menghentikan startup, bukan dibiarkan berjalan tanpa perlindungan. PUT **dan POST upsert** mewajibkan `expected_revision` (`428` bila kosong, `409` bila basi); UI menyegarkan data dan meminta operator membuka ulang formulir edit.
 
 ### API dan keamanan
 

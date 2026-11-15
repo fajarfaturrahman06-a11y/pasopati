@@ -37,6 +37,7 @@ import re
 import secrets
 import ssl
 import time
+import errno
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -1717,7 +1718,7 @@ def _write_text_atomic(path, text):
         os.chmod(tmp, mode)
     except Exception:
         pass
-    os.replace(tmp, path)
+    _atomic_replace(tmp, path)
 
 def _sshd_config_files():
     files = []
@@ -2302,7 +2303,7 @@ def _sudoers_write(path, content, mode, force=False):
             os.chmod(path, 0o600)
     except Exception:
         pass
-    os.replace(tmp, path)
+    _atomic_replace(tmp, path)
     try:
         os.chmod(path, mode)
     except Exception:
@@ -3013,6 +3014,26 @@ def _history_path():
 
 _MACHINE_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 
+def _atomic_replace(source, target, attempts=6, base_delay=0.025, deadline=2.0):
+    """Ganti file via rename dengan retry singkat untuk EPERM/EACCES/EBUSY (Windows).
+
+    Error permanen (ENOENT, ENOSPC, dst.) langsung dilempar. File tujuan tidak
+    dihapus lebih dulu sehingga atomicity tidak rusak.
+    """
+    retryable = {errno.EPERM, errno.EACCES, errno.EBUSY}
+    started = time.time()
+    for attempt in range(1, attempts + 1):
+        try:
+            os.replace(source, target)
+            return
+        except OSError as error:
+            if getattr(error, "errno", None) not in retryable:
+                raise
+            remaining = deadline - (time.time() - started)
+            if attempt >= attempts or remaining <= 0:
+                raise
+            time.sleep(min(base_delay * (2 ** (attempt - 1)), 0.4, remaining))
+
 def get_machine_id():
     """UUID mesin yang dibuat sekali dan dipakai ulang (identitas endpoint stabil).
 
@@ -3037,7 +3058,7 @@ def get_machine_id():
             os.chmod(tmp, 0o600)
         except Exception:
             pass
-        os.replace(tmp, path)
+        _atomic_replace(tmp, path)
     except Exception:
         pass
     return fresh
@@ -3060,7 +3081,7 @@ def append_history(entry):
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(history, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, path)
+        _atomic_replace(tmp, path)
         try:
             os.chmod(path, 0o600)
         except Exception:
@@ -3780,7 +3801,7 @@ def main(argv=None, entry_script=None, parser_only=False):
     tmp_path = args.output + ".tmp"
     with open(tmp_path, "w") as f:
         json.dump(result, f, indent=2)
-    os.replace(tmp_path, args.output)
+    _atomic_replace(tmp_path, args.output)
     try:
         os.chmod(args.output, 0o600)
     except Exception:

@@ -1,5 +1,21 @@
 # Changelog
 
+## Perbaikan Windows EPERM pada atomic write — 15 Nov 2026
+
+### Diperbaiki
+- `writeJsonAtomic` (`server.ts`) dan `writeEndpointRecords` (`src/endpointStore.ts`) memakai helper bersama `src/atomicWrite.ts` yang me-retry rename **hanya** untuk `EPERM`/`EACCES`/`EBUSY` dengan backoff terbatas (maks 6 percobaan / ~2 detik).
+- Error permanen (`ENOENT`, `ENOSPC`, dll.) langsung dilempar tanpa retry. File tujuan tidak dihapus sebelum rename; tidak ada fallback copy+delete.
+- Temp unik + `fsync` file + close + rename + `fsync` direktori tetap dipertahankan; temp dibersihkan bila semua percobaan gagal dan file tujuan lama tetap utuh.
+- Helper Python `_atomic_replace` diterapkan pada 5 `os.replace` di `pasopati_audit.py` untuk masalah yang sama di Windows.
+
+### Diuji
+- Regression `tests/atomic-write.mjs` (6 kasus): retry sementara, error permanen, retry habis + tujuan utuh + temp bersih, writer registry memakai jalur yang sama.
+- Unit Python: retry sementara, error permanen, gagal total tidak menghapus tujuan.
+- `test:endpoints` dijalankan dua kali berturut-turut di Windows: 27/27 dan 27/27.
+
+### Catatan race
+- Tidak ada perubahan pada `.server.lock`. Semua read-modify-write audit/registry tetap sinkron dalam satu event loop; tidak ada `await` di antaranya. Retry hanya membungkus syscall rename, bukan transaksi.
+
 ## Perbaikan registry pusat pasca-audit — 15 Nov 2026
 
 Pengerasan konsistensi data, integritas audit, dan kesiapan VPS. Tanpa perubahan

@@ -19,6 +19,7 @@ import type { EndpointHealthAuditEventType, EndpointHealthAuditRecord } from './
 import { appendActivityAuditRecord, readActivityAuditRecords } from './src/activityAuditStore';
 import type { ActivityAuditEventType } from './src/activityAuditStore';
 import { isValidPassword, isValidUsername, SESSION_TTL_SECONDS, UserSessionStore } from './src/userSessions';
+import { writeJsonAtomicSync } from './src/atomicWrite';
 
 dotenv.config();
 
@@ -59,28 +60,9 @@ const userSessionStore = new UserSessionStore(
   process.env.PASOPATI_ADMIN_PASSWORD || ''
 );
 
-/** Tulis JSON secara atomik (tmp + rename) agar file state tidak pernah setengah jadi. */
+/** Tulis JSON secara atomik (temp + fsync + rename retry) agar file state tidak setengah jadi. */
 function writeJsonAtomic(filePath: string, value: unknown) {
-  const dir = path.dirname(filePath);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  const tmp = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
-  const descriptor = fs.openSync(tmp, 'wx', 0o600);
-  try {
-    fs.writeFileSync(descriptor, JSON.stringify(value, null, 2), { encoding: 'utf-8' });
-    fs.fsyncSync(descriptor);
-  } finally {
-    fs.closeSync(descriptor);
-  }
-  try {
-    fs.renameSync(tmp, filePath);
-  } catch (error) {
-    try { fs.rmSync(tmp, { force: true }); } catch { /* preserve rename error */ }
-    throw error;
-  }
-  try {
-    const dirDescriptor = fs.openSync(dir, 'r');
-    try { fs.fsyncSync(dirDescriptor); } finally { fs.closeSync(dirDescriptor); }
-  } catch { /* metadata direktori tidak selalu bisa di-fsync */ }
+  writeJsonAtomicSync(filePath, value);
 }
 
 app.use(express.json({

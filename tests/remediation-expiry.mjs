@@ -18,6 +18,8 @@ const API_KEY = 'expiry-api-key';
 const HMAC_SECRET = 'expiry-hmac';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const results = [];
+// Hindari rentang port yang bisa dieksklusikan Windows/Hyper-V.
+const BASE_PORT = 6100 + Math.floor(Math.random() * 300);
 function check(name, passed, detail = '') {
   results.push({ name, passed });
   console.log(`${passed ? 'PASS' : 'FAIL'}  ${name}${detail ? ` — ${detail}` : ''}`);
@@ -99,7 +101,7 @@ const postAudit = {
 try {
   // ---- A. token pendek: approve ulang setelah kedaluwarsa harus boleh ----
   {
-    const port = 3521;
+    const port = BASE_PORT;
     const { server, dataDir } = await boot(port, { REMEDIATION_TOKEN_TTL_MS: '200', REMEDIATION_EVIDENCE_GRACE_MS: '5000' });
     const { planId, nonce } = await newPlan(port);
     await sleep(350);
@@ -117,7 +119,7 @@ try {
 
   // ---- B. batas evidence pendek: verify setelah batas harus 401 ----
   {
-    const port = 3522;
+    const port = BASE_PORT + 1;
     const { server, dataDir } = await boot(port, { REMEDIATION_TOKEN_TTL_MS: '100', REMEDIATION_EVIDENCE_GRACE_MS: '200' });
     const { planId, nonce } = await newPlan(port);
     await sleep(400);

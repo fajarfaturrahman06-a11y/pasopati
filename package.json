@@ -18,8 +18,9 @@
     "test:agent": "node scripts/run-python.mjs tests/test_agent_remediation.py",
     "test:scripts": "tsx tests/scripts-coverage.ts",
     "test:app": "node scripts/run-python.mjs tests/test_app_scripts.py",
+    "test:atomic": "node --import tsx tests/atomic-write.mjs",
     "test:elevation": "node tests/elevation-real.mjs",
-    "test": "npm run lint && npm run test:smoke && npm run test:auth && npm run test:endpoints && npm run test:endpoint-health-audit && npm run test:expiry && npm run test:agent && npm run test:scripts && npm run test:app && npm run test:redaction && npm run test:elevation",
+    "test": "npm run lint && npm run test:smoke && npm run test:auth && npm run test:endpoints && npm run test:endpoint-health-audit && npm run test:expiry && npm run test:atomic && npm run test:agent && npm run test:scripts && npm run test:app && npm run test:redaction && npm run test:elevation",
     "test:redaction": "tsx tests/redaction.ts"
   },
   "dependencies": {

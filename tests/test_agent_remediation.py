@@ -988,5 +988,54 @@ class MachineIdentityTests(unittest.TestCase):
         self.assertNotEqual(fresh, "rusak!")
 
 
+class AtomicReplaceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pasopati-atomic-")
+        self.source = os.path.join(self.tmp, "a.tmp")
+        self.target = os.path.join(self.tmp, "a.json")
+        with open(self.target, "w", encoding="utf-8") as handle:
+            handle.write("lama")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_retry_sementara_lalu_berhasil(self):
+        calls = {"n": 0}
+        real = os.replace
+
+        def flaky(src, dst):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise PermissionError(13, "simulasi")
+            real(src, dst)
+
+        with open(self.source, "w", encoding="utf-8") as handle:
+            handle.write("baru")
+        with mock.patch.object(agent.os, "replace", flaky):
+            agent._atomic_replace(self.source, self.target)
+        with open(self.target, "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "baru")
+        self.assertEqual(calls["n"], 3)
+
+    def test_error_permanen_dilempar(self):
+        with open(self.source, "w", encoding="utf-8") as handle:
+            handle.write("baru")
+        with mock.patch.object(agent.os, "replace", side_effect=OSError(2, "hilang")):
+            with self.assertRaises(OSError):
+                agent._atomic_replace(self.source, self.target)
+        with open(self.target, "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "lama")
+
+    def test_gagal_total_tidak_menghapus_tujuan(self):
+        with open(self.source, "w", encoding="utf-8") as handle:
+            handle.write("baru")
+        with mock.patch.object(agent.os, "replace", side_effect=PermissionError(13, "sibuk")):
+            with self.assertRaises(PermissionError):
+                agent._atomic_replace(self.source, self.target, attempts=3, base_delay=0.001)
+        with open(self.target, "r", encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "lama")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
