@@ -20,6 +20,7 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
   const [plan, setPlan] = useState<RemediationPlan | null>(null);
   const [token, setToken] = useState<string>('');
   const [hmacKey, setHmacKey] = useState<string>('');
+  const [apiKey, setApiKey] = useState<string>('');
   const [serverUrl, setServerUrl] = useState<string>(() =>
     typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000'
   );
@@ -268,8 +269,8 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
   }
 
   const planJsonText = plan ? JSON.stringify(plan, null, 2) : '';
-  const cmdText = plan ? agentCommandText(serverUrl, plan.planId, '', hmacKey, Boolean(plan.requiresConsoleAck)) : '';
-  const fallbackCmdText = plan ? wslCommandText(serverUrl, 'plan.json', token, '', Boolean(plan.requiresConsoleAck)) : '';
+  const cmdText = plan ? agentCommandText(serverUrl, plan.planId, apiKey, hmacKey, Boolean(plan.requiresConsoleAck)) : '';
+  const fallbackCmdText = plan ? wslCommandText(serverUrl, 'plan.json', token, apiKey, Boolean(plan.requiresConsoleAck)) : '';
 
   return (
     <div className="space-y-6">
@@ -736,6 +737,17 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
                   />
                 </div>
                 <div className="flex items-center gap-2 text-[11px] font-mono text-slate-400">
+                  <KeyRound className="w-3.5 h-3.5 text-amber-300" />
+                  API key agent (PASOPATI_API_KEY):
+                  <input
+                    type="password"
+                    value={apiKey}
+                    onChange={e => setApiKey(e.target.value)}
+                    placeholder="dari .env server / operator"
+                    className="flex-1 min-w-0 px-2 py-1 text-[11px] font-mono bg-slate-900 border border-slate-700 rounded text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-amber-500"
+                  />
+                </div>
+                <div className="flex items-center gap-2 text-[11px] font-mono text-slate-400">
                   <KeyRound className="w-3.5 h-3.5 text-rose-400" />
                   HMAC key (HMAC_SECRET):
                   <input
@@ -746,6 +758,9 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
                     className="flex-1 min-w-0 px-2 py-1 text-[11px] font-mono bg-slate-900 border border-slate-700 rounded text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-rose-500"
                   />
                 </div>
+                <p className="text-[10px] font-mono text-slate-500">
+                  API/HMAC hanya disimpan di memori browser (tidak dikirim ke server saat mengetik); perintah di bawah menampilkan nilainya apa adanya.
+                </p>
                 <pre className="text-[11px] font-mono text-rose-300 overflow-auto max-h-40 leading-relaxed whitespace-pre-wrap">{cmdText || 'Approve plan untuk mendapatkan perintah…'}</pre>
                 <p className="text-[11px] font-mono text-slate-500">
                   Jalankan di host target. Agent mengambil plan langsung dari server — target hanya butuh <code>pasopati_remediate.py</code> + <code>pasopati_audit.py</code>.
