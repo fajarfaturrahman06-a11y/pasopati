@@ -1,5 +1,14 @@
 # Changelog
 
+## Sinkron skor pasca-remediasi & dead-man Windows — 15 Nov 2026
+
+### Diperbaiki
+- Setelah `VERIFIED` dengan `postAudit`, registry endpoint kini memperbarui `checks`, `history`,
+  dan `revision` dari hasil audit ulang. Dashboard tidak lagi menampilkan skor pra-remediasi
+  (mis. 57) sementara laporan agent 65.
+- Penjadwalan dead-man Windows memakai buffer +2 menit dengan satu retry +5 menit; pesan
+  kegagalan `schtasks` tidak lagi terpotong 200 karakter.
+
 ## Tombol simpan & kirim script — 15 Nov 2026
 
 ### Ditambah

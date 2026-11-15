@@ -1439,15 +1439,20 @@ def _deadman_arm(plan_id, seconds):
         log_path = os.path.join(backup_dir, f"{plan_id}_deadman.log")
         with open(ps, "w") as f:
             f.write(_deadman_ps_script(seconds, confirm, plan_id, backup_dir, log_path))
-        target = datetime.datetime.now() + datetime.timedelta(seconds=seconds)
-        rc, out = _run_no_shell([
-            "schtasks", "/create", "/f", "/tn", _deadman_task_name(plan_id),
-            "/sc", "once", "/st", target.strftime("%H:%M"), "/sd", target.strftime("%m/%d/%Y"),
-            "/ru", "SYSTEM", "/rl", "HIGHEST",
-            "/tr", f'powershell -NoProfile -ExecutionPolicy Bypass -File "{ps}"'
-        ], 30)
+        target = datetime.datetime.now() + datetime.timedelta(seconds=seconds + 120)
+        def _create_task(when):
+            return _run_no_shell([
+                "schtasks", "/create", "/f", "/tn", _deadman_task_name(plan_id),
+                "/sc", "once", "/st", when.strftime("%H:%M"), "/sd", when.strftime("%m/%d/%Y"),
+                "/ru", "SYSTEM", "/rl", "HIGHEST",
+                "/tr", f'powershell -NoProfile -ExecutionPolicy Bypass -File "{ps}"'
+            ], 30)
+        rc, out = _create_task(target)
         if rc != 0:
-            raise RuntimeError((out or "").strip()[:200] or "schtasks gagal")
+            # Jam "sekali" yang sudah lewat/tepat sekarang sering ditolak; coba buffer 5 menit.
+            rc, out = _create_task(datetime.datetime.now() + datetime.timedelta(seconds=seconds + 300))
+        if rc != 0:
+            raise RuntimeError((out or "").strip()[:300] or "schtasks gagal")
         return "task " + _deadman_task_name(plan_id)
     script = os.path.join(backup_dir, f"{plan_id}_deadman.sh")
     with open(script, "w") as f:

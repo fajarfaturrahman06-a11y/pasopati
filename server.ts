@@ -2138,6 +2138,49 @@ app.post('/api/remediation-verify', requireRole('executor', 'agent'), rateLimit(
       }))
     };
     plan.postAuditAt = new Date().toISOString();
+    // Sinkronkan registry dengan hasil audit ulang agar dashboard tidak tertinggal
+    // menampilkan kondisi pra-remediasi.
+    try {
+      const records = endpointRecords();
+      const index = records.findIndex(item => !item.deletedAt &&
+        (item.id === plan.deviceId || item.agentId === plan.deviceId || item.hostname === plan.deviceId));
+      if (index >= 0) {
+        const endpoint = records[index];
+        const mappedChecks: Array<{ id: string; parameter: string; category: string; cis_id: string; status: string; details: string; mitigation: string }> = matrix.slice(0, 500).map((c: any, i: number) => {
+          const rawStatus = String(c?.status ?? '').toUpperCase();
+          const status = (['PASS', 'WARNING', 'FAIL', 'N/A', 'WAIVED'].includes(rawStatus) ? rawStatus : 'WARNING');
+          return {
+            id: `post-${i + 1}`,
+            parameter: String(c?.parameter ?? '').slice(0, 200),
+            category: String(c?.category ?? 'Network & Port'),
+            cis_id: String(c?.cis_id ?? c?.cis ?? '').slice(0, 120),
+            status,
+            details: String(c?.details ?? '').slice(0, 2000),
+            mitigation: String(c?.mitigation ?? '').slice(0, 2000)
+          };
+        });
+        const count = (status: string) => mappedChecks.filter(c => c.status === status).length;
+        const applicable = mappedChecks.filter(c => c.status !== 'N/A' && c.status !== 'WAIVED').length || 1;
+        const computed = Math.round(((count('PASS') * 100) + (count('WARNING') * 50)) / applicable);
+        const score = Number(body.postAudit?.scoring?.cyber_readiness_score);
+        endpoint.checks = mappedChecks as typeof endpoint.checks;
+        endpoint.updatedAt = new Date().toISOString();
+        endpoint.updated_at = endpoint.updatedAt;
+        endpoint.revision = (endpoint.revision || 1) + 1;
+        endpoint.history = [...(endpoint.history || []), {
+          timestamp: endpoint.updatedAt.replace('T', ' ').substring(0, 19),
+          score: Number.isFinite(score) ? score : computed,
+          passCount: count('PASS'),
+          warnCount: count('WARNING'),
+          failCount: count('FAIL'),
+          event: 'Audit ulang pasca-remediasi'
+        }].slice(-200);
+        records[index] = endpoint;
+        writeEndpointRecords(ENDPOINTS_PATH, records);
+      }
+    } catch (syncErr) {
+      console.error('[PASOPATI] Gagal menyinkronkan registry setelah audit ulang:', (syncErr as Error).message);
+    }
   }
 
   plan.status = target;
