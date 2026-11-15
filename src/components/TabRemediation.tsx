@@ -535,6 +535,16 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
             REFRESH
           </button>
         </div>
+        {plan && plan.status === 'PLANNED' && whoami && plan.createdBy === whoami.name && !selfApprove && (
+          <div className="text-[11px] font-mono text-amber-300">
+            Tombol APPROVE masih nonaktif: centang <strong>setujui sendiri</strong> di atas, atau minta operator lain menyetujui.
+          </div>
+        )}
+        {plan && plan.status === 'PLANNED' && plan.requiresConsoleAck && !ackConsole && (
+          <div className="text-[11px] font-mono text-amber-300">
+            Tombol APPROVE nonaktif: centang konfirmasi konsol/KVM terlebih dahulu.
+          </div>
+        )}
       </div>
 
       {plan && (
