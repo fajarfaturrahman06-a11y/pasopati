@@ -1440,19 +1440,40 @@ def _deadman_arm(plan_id, seconds):
         with open(ps, "w") as f:
             f.write(_deadman_ps_script(seconds, confirm, plan_id, backup_dir, log_path))
         target = datetime.datetime.now() + datetime.timedelta(seconds=seconds + 120)
-        def _create_task(when):
-            return _run_no_shell([
+        def _create_task(when, date_fmt):
+            args = [
                 "schtasks", "/create", "/f", "/tn", _deadman_task_name(plan_id),
-                "/sc", "once", "/st", when.strftime("%H:%M"), "/sd", when.strftime("%m/%d/%Y"),
+                "/sc", "once", "/st", when.strftime("%H:%M"),
+            ]
+            if date_fmt:
+                args += ["/sd", when.strftime(date_fmt)]
+            args += [
                 "/ru", "SYSTEM", "/rl", "HIGHEST",
                 "/tr", f'powershell -NoProfile -ExecutionPolicy Bypass -File "{ps}"'
-            ], 30)
-        rc, out = _create_task(target)
+            ]
+            return _run_no_shell(args, 30)
+
+        def _create_with_formats(when):
+            # Format /sd bergantung locale Windows (ID: dd/MM/yyyy). Tanpa /sd
+            # berarti hari ini; coba itu dulu bila tidak melewati tengah malam.
+            formats = []
+            if when.date() == datetime.date.today():
+                formats.append(None)
+            formats.extend(["%d/%m/%Y", "%m/%d/%Y"])
+            last = (1, "schtasks gagal")
+            for fmt in formats:
+                rc, out = _create_task(when, fmt)
+                if rc == 0:
+                    return rc, out
+                last = (rc, out)
+            return last
+
+        rc, out = _create_with_formats(target)
         if rc != 0:
             # Jam "sekali" yang sudah lewat/tepat sekarang sering ditolak; coba buffer 5 menit.
-            rc, out = _create_task(datetime.datetime.now() + datetime.timedelta(seconds=seconds + 300))
+            rc, out = _create_with_formats(datetime.datetime.now() + datetime.timedelta(seconds=seconds + 300))
         if rc != 0:
-            raise RuntimeError((out or "").strip()[:300] or "schtasks gagal")
+            raise RuntimeError((out or "").strip()[:500] or "schtasks gagal")
         return "task " + _deadman_task_name(plan_id)
     script = os.path.join(backup_dir, f"{plan_id}_deadman.sh")
     with open(script, "w") as f:

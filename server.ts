@@ -2148,7 +2148,8 @@ app.post('/api/remediation-verify', requireRole('executor', 'agent'), rateLimit(
         const endpoint = records[index];
         const mappedChecks: Array<{ id: string; parameter: string; category: string; cis_id: string; status: string; details: string; mitigation: string }> = matrix.slice(0, 500).map((c: any, i: number) => {
           const rawStatus = String(c?.status ?? '').toUpperCase();
-          const status = (['PASS', 'WARNING', 'FAIL', 'N/A', 'WAIVED'].includes(rawStatus) ? rawStatus : 'WARNING');
+          const normalized = rawStatus === 'SKIPPED' ? 'N/A' : rawStatus;
+          const status = (['PASS', 'WARNING', 'FAIL', 'N/A', 'WAIVED'].includes(normalized) ? normalized : 'WARNING');
           return {
             id: `post-${i + 1}`,
             parameter: String(c?.parameter ?? '').slice(0, 200),
