@@ -114,7 +114,7 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
     try {
       const created = await createPlan(currentDevice.id, selectedItems, hostId || undefined, {
         executionMode,
-        ...(executionMode === 'manual' ? { artifacts: { hardening: scripts.hard, rollback: scripts.roll } } : {})
+        artifacts: { hardening: scripts.hard, rollback: scripts.roll }
       });
       setPlan(created);
       setToken('');
@@ -339,7 +339,7 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
               {!plan && <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 text-slate-400">PRATINJAU</span>}
             </span>
             <div className="flex items-center gap-2">
-              {plan ? (
+              {plan?.artifacts ? (
                 <>
                   <a
                     href={`/api/remediation-plans/${encodeURIComponent(plan.planId)}/artifacts/hardening`}
