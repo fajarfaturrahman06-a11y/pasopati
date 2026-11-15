@@ -11,8 +11,7 @@ import {
   VolumeX,
   X,
   ShieldCheck,
-  Radio,
-  Database
+  Radio
 } from 'lucide-react';
 import { sfx } from '../utils/audio';
 
@@ -37,9 +36,11 @@ const MENU = [
   { id: 1, label: 'Endpoint Audit', icon: MonitorSmartphone },
   { id: 2, label: 'Hardening & Remediation', icon: Wrench },
   { id: 3, label: 'Agent & Upload', icon: UploadCloud },
-  { id: 4, label: 'Audit Log', icon: ScrollText },
-  { id: 5, label: 'Audit Endpoint & Kondisi', icon: Database }
+  { id: 4, label: 'Audit Log', icon: ScrollText }
 ];
+
+/** Role viewer hanya boleh membuka Dashboard, Endpoint Audit, dan Agent & Upload. */
+const VIEWER_MENU_IDS = [0, 1, 3];
 
 export const Sidebar: React.FC<SidebarProps> = ({
   activeTab,
@@ -150,7 +151,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           Menu Utama
         </div>
         <nav className="mt-2 flex-1 space-y-1 overflow-y-auto px-3 pb-4">
-          {MENU.filter(item => item.id !== 5 || principalRole === 'admin').map(item => {
+          {MENU.filter(item => principalRole !== 'viewer' || VIEWER_MENU_IDS.includes(item.id)).map(item => {
             const Icon = item.icon;
             const isActive = activeTab === item.id;
             return (

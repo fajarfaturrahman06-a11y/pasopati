@@ -27,6 +27,7 @@ interface TabCommandCenterProps {
   centralEndpointData: boolean;
   canManageEndpoints: boolean;
   canDeleteEndpoints: boolean;
+  canViewAuditLog?: boolean;
   lastEndpointSync: string | null;
   onSaveEndpoint: (payload: EndpointDraftPayload, id?: string, expectedRevision?: number) => Promise<void>;
   onDeleteEndpoint: (id: string) => Promise<void>;
@@ -51,6 +52,7 @@ export const TabCommandCenter: React.FC<TabCommandCenterProps> = ({
   centralEndpointData,
   canManageEndpoints,
   canDeleteEndpoints,
+  canViewAuditLog = true,
   lastEndpointSync,
   onSaveEndpoint,
   onDeleteEndpoint
@@ -389,9 +391,11 @@ export const TabCommandCenter: React.FC<TabCommandCenterProps> = ({
               Audit trail dari server · {auditLogs.length} entri
             </p>
           </div>
-          <button onClick={() => onNavigate(4)} className="pasopati-link inline-flex items-center gap-1">
-            Lihat Semua <ArrowUpRight className="h-3 w-3" />
-          </button>
+          {canViewAuditLog && (
+            <button onClick={() => onNavigate(4)} className="pasopati-link inline-flex items-center gap-1">
+              Lihat Semua <ArrowUpRight className="h-3 w-3" />
+            </button>
+          )}
         </div>
 
         {recentLogs.length === 0 ? (

@@ -1,17 +1,18 @@
 import React from 'react';
 import { DeviceInfo } from '../types';
 import { calculateDeviceScore } from '../data/mockDevices';
-import { ShieldCheck, AlertTriangle, XCircle, ArrowRight, Server, Network, UserCheck, HardDrive, Cpu, ShieldAlert, Activity, Lock, Unlock, MinusCircle } from 'lucide-react';
+import { ShieldCheck, AlertTriangle, XCircle, ArrowRight, Server, Network, UserCheck, HardDrive, Cpu, ShieldAlert, Activity, Lock, Unlock, MinusCircle, ListChecks, History } from 'lucide-react';
 import { sfx } from '../utils/audio';
+import { EndpointActivityView } from './EndpointActivityView';
 
 interface TabDeepAuditProps {
   devices: DeviceInfo[];
   selectedDeviceId: string;
-  onSelectDevice: (deviceId: string) => void;
-  onNavigateToHardening: (deviceId: string) => void;
-  onToggleQuarantine?: (deviceId: string) => void;
+  onSelectDevice: (currentDeviceId: string) => void;
+  onNavigateToHardening: (currentDeviceId: string) => void;
+  onToggleQuarantine?: (currentDeviceId: string) => void;
   principalRole?: string | null;
-  onWaiversChanged?: (deviceId: string) => void;
+  onWaiversChanged?: (currentDeviceId: string) => void;
 }
 
 export const TabDeepAudit: React.FC<TabDeepAuditProps> = ({
@@ -23,13 +24,15 @@ export const TabDeepAudit: React.FC<TabDeepAuditProps> = ({
   principalRole,
   onWaiversChanged
 }) => {
-  const currentDevice = devices.find(d => d.id === selectedDeviceId) || devices[0];
+  const currentDevice = (devices.find(d => d.id === selectedDeviceId) || devices[0]) as DeviceInfo;
   const [waiverBusy, setWaiverBusy] = React.useState<string | null>(null);
+  const [view, setView] = React.useState<'findings' | 'activity'>('findings');
+  const isAdmin = principalRole === 'admin';
   const waiversEnabled = principalRole === 'admin' || principalRole === 'planner';
-  if (!currentDevice) {
+  if (!currentDevice && view === 'findings') {
     return <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-8 text-center text-sm text-slate-400">Belum ada endpoint pusat. Tambahkan endpoint dari Dashboard atau kirim telemetry agen.</div>;
   }
-  const deviceScore = calculateDeviceScore(currentDevice.checks || []);
+  const currentDeviceScore = calculateDeviceScore(currentDevice.checks || []);
 
   const handleWaive = async (parameter: string) => {
     if (!waiversEnabled) return;
@@ -73,6 +76,38 @@ export const TabDeepAudit: React.FC<TabDeepAuditProps> = ({
 
   return (
     <div className="space-y-6">
+
+      {isAdmin && (
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => { sfx.playClick(); setView('findings'); }}
+            className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-bold transition-colors ${
+              view === 'findings'
+                ? 'border-rose-600/70 bg-rose-950/40 text-rose-200'
+                : 'border-slate-800 bg-slate-900/70 text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <ListChecks className="h-3.5 w-3.5" /> Matriks Temuan Audit
+          </button>
+          <button
+            type="button"
+            onClick={() => { sfx.playClick(); setView('activity'); }}
+            className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-bold transition-colors ${
+              view === 'activity'
+                ? 'border-cyan-600/70 bg-cyan-950/40 text-cyan-200'
+                : 'border-slate-800 bg-slate-900/70 text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <History className="h-3.5 w-3.5" /> Aktivitas &amp; Akses <span className="text-[9px] font-mono uppercase opacity-70">admin</span>
+          </button>
+        </div>
+      )}
+
+      {view === 'activity' && isAdmin ? (
+        <EndpointActivityView devices={devices} />
+      ) : (
+      <>
       
       {/* Header & Device Selector */}
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 bg-slate-900/60 p-5 rounded-lg border border-slate-800">
@@ -136,14 +171,15 @@ export const TabDeepAudit: React.FC<TabDeepAuditProps> = ({
               <span className="text-[11px] font-mono text-slate-400 block">Kesiapan Endpoint</span>
               <span
                 className={`text-2xl font-bold font-mono tabular-nums ${
-                  deviceScore >= 75 ? 'text-emerald-400' : deviceScore >= 50 ? 'text-amber-400' : 'text-rose-400'
+                  currentDeviceScore >= 75 ? 'text-emerald-400' : currentDeviceScore >= 50 ? 'text-amber-400' : 'text-rose-400'
                 }`}
               >
-                {deviceScore}/100
+                {currentDeviceScore}/100
               </span>
             </div>
 
             {/* Emergency Network Quarantine Switch (DEFCON 1 Kill-Switch) */}
+            {principalRole !== 'viewer' && (
             <button
               onClick={() => {
                 sfx.playPing();
@@ -159,7 +195,9 @@ export const TabDeepAudit: React.FC<TabDeepAuditProps> = ({
               {currentDevice.isQuarantined ? <Unlock className="w-3.5 h-3.5 text-rose-400" /> : <Lock className="w-3.5 h-3.5 text-rose-400" />}
               <span>{currentDevice.isQuarantined ? 'ISOLASI DITANDAI (LEPAS)' : 'TANDAI KARANTINA'}</span>
             </button>
+            )}
 
+            {principalRole !== 'viewer' && (
             <button
               onClick={() => {
                 sfx.playClick();
@@ -170,6 +208,7 @@ export const TabDeepAudit: React.FC<TabDeepAuditProps> = ({
               <span>Remediasi AI</span>
               <ArrowRight className="w-3.5 h-3.5" />
             </button>
+            )}
           </div>
         </div>
 
@@ -390,6 +429,9 @@ export const TabDeepAudit: React.FC<TabDeepAuditProps> = ({
           })}
         </div>
       </div>
+
+      </>
+      )}
 
     </div>
   );

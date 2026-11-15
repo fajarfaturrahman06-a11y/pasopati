@@ -11,7 +11,6 @@ import { TabDeepAudit } from './components/TabDeepAudit';
 import { TabAIHardening } from './components/TabAIHardening';
 import { TabLiveAgent } from './components/TabLiveAgent';
 import { TabAuditLog } from './components/TabAuditLog';
-import { TabEndpointHealthAudit } from './components/TabEndpointHealthAudit';
 import { LoginGate, type PrincipalIdentity } from './components/LoginGate';
 import { OperatorTestAccess } from './components/OperatorTestAccess';
 import { INITIAL_MOCK_DEVICES, calculateFleetScore, calculateDeviceScore } from './data/mockDevices';
@@ -110,6 +109,10 @@ export default function App() {
       .finally(() => { if (!cancelled) setAuthReady(true); });
     return () => { cancelled = true; };
   }, []);
+
+  useEffect(() => {
+    if (principalRole === 'viewer' && ![0, 1, 3].includes(activeTab)) setActiveTab(0);
+  }, [principalRole, activeTab]);
 
   const handleDirectDownload = async (fileName: string, url: string) => {
     sfx.playSuccess();
@@ -667,8 +670,9 @@ export default function App() {
             onNavigate={setActiveTab}
             endpointSyncStatus={endpointSyncStatus}
             centralEndpointData={centralEndpointData}
-            canManageEndpoints={principalRole === 'admin' || principalRole === 'planner'}
+            canManageEndpoints={principalRole === 'admin' || principalRole === 'planner' || principalRole === 'viewer'}
             canDeleteEndpoints={principalRole === 'admin'}
+            canViewAuditLog={principalRole !== 'viewer'}
             lastEndpointSync={lastEndpointSync}
             onSaveEndpoint={saveEndpoint}
             onDeleteEndpoint={deleteEndpoint}
@@ -717,15 +721,6 @@ export default function App() {
             onLogsUpdated={setAuditLogs}
             onShowToast={showToast}
           />
-        )}
-
-        {activeTab === 5 && principalRole === 'admin' && (
-          <TabEndpointHealthAudit devices={devices} />
-        )}
-        {activeTab === 5 && principalRole !== 'admin' && (
-          <div className="rounded-xl border border-rose-900/50 bg-rose-950/20 p-5 text-sm text-rose-200">
-            Fitur Audit Endpoint &amp; Kondisi hanya tersedia untuk administrator.
-          </div>
         )}
 
       </main>

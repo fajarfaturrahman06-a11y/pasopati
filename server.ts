@@ -16,6 +16,8 @@ import { findEndpointByIdentity, normalizeEndpointInput, readEndpointRecords, wr
 import type { EndpointRecord } from './src/endpointStore';
 import { appendEndpointHealthAuditRecord, readEndpointHealthAuditRecords } from './src/endpointHealthAuditStore';
 import type { EndpointHealthAuditEventType, EndpointHealthAuditRecord } from './src/endpointHealthAuditStore';
+import { appendActivityAuditRecord, readActivityAuditRecords } from './src/activityAuditStore';
+import type { ActivityAuditEventType } from './src/activityAuditStore';
 import { isValidPassword, isValidUsername, SESSION_TTL_SECONDS, UserSessionStore } from './src/userSessions';
 
 dotenv.config();
@@ -546,6 +548,7 @@ app.post('/api/auth/users', requireRole('admin'), rateLimit(20, 'auth-user-creat
 
 const ENDPOINTS_PATH = path.join(DATA_DIR, 'endpoint_inventory.json');
 const ENDPOINT_HEALTH_AUDIT_DB_PATH = path.join(DATA_DIR, 'endpoint_health_audit.sqlite');
+const ACTIVITY_AUDIT_DB_PATH = path.join(DATA_DIR, 'activity_audit.sqlite');
 const MAX_ENDPOINT_BODY_BYTES = 1024 * 1024;
 
 function endpointRecords(): EndpointRecord[] {
@@ -563,6 +566,37 @@ function endpointBodyTooLarge(req: Request, res: Response): boolean {
 
 function endpointActor(req: Request): string {
   return (req as Request & { principal?: Principal }).principal?.name || 'operator';
+}
+
+/**
+ * Catat aktivitas baca-saja (unduhan berkas, scan realtime) untuk panel
+ * "Aktivitas & Akses" yang hanya bisa dibaca admin. Kegagalan tulis tidak
+ * boleh menggagalkan respons utama, jadi galat hanya dilog.
+ */
+function recordActivity(
+  req: Request,
+  eventType: ActivityAuditEventType,
+  subject: string,
+  detail: string,
+  status: 'SUCCESS' | 'FAILED'
+) {
+  try {
+    const principal = resolvePrincipal(req);
+    const ip = String(req.ip || req.socket?.remoteAddress || '').slice(0, 128);
+    appendActivityAuditRecord(ACTIVITY_AUDIT_DB_PATH, {
+      id: crypto.randomUUID(),
+      eventType,
+      occurredAt: new Date().toISOString(),
+      actor: (principal?.name || 'anonim').slice(0, 80),
+      actorRole: (principal?.role || 'anonim').slice(0, 20),
+      ...(ip ? { sourceIp: ip } : {}),
+      subject: subject.slice(0, 160),
+      detail: detail.slice(0, 200),
+      status
+    });
+  } catch (err) {
+    console.error('[PASOPATI] Gagal menulis aktivitas audit:', (err as Error).message);
+  }
 }
 
 function buildEndpointHealthAuditRecord(input: {
@@ -779,7 +813,7 @@ app.get('/api/endpoints/:id', requireApiKey, rateLimit(120, 'endpoint-read'), (r
   }
 });
 
-app.post('/api/endpoints', requireRole('planner'), rateLimit(30, 'endpoint-write'), (req, res) => {
+app.post('/api/endpoints', requireRole('planner', 'viewer'), rateLimit(30, 'endpoint-write'), (req, res) => {
   if (endpointBodyTooLarge(req, res)) return;
   try {
     const input = normalizeEndpointInput(req.body);
@@ -815,7 +849,7 @@ app.post('/api/endpoints', requireRole('planner'), rateLimit(30, 'endpoint-write
   }
 });
 
-app.put('/api/endpoints/:id', requireRole('planner'), rateLimit(30, 'endpoint-write'), (req, res) => {
+app.put('/api/endpoints/:id', requireRole('planner', 'viewer'), rateLimit(30, 'endpoint-write'), (req, res) => {
   if (endpointBodyTooLarge(req, res)) return;
   try {
     const records = endpointRecords();
@@ -1683,6 +1717,26 @@ app.get('/api/admin/endpoint-health-audit', requireRole('admin'), rateLimit(120,
   }
 });
 
+// Aktivitas unduhan & scan realtime: hanya admin yang boleh melihat.
+app.get('/api/admin/activity-audit', requireRole('admin'), rateLimit(120, 'activity-audit-read'), (req, res) => {
+  const typeParam = typeof req.query.type === 'string' ? req.query.type : '';
+  if (typeParam && typeParam !== 'FILE_DOWNLOADED' && typeParam !== 'REALTIME_SCAN') {
+    return res.status(400).json({ status: 'rejected', reason: 'type harus FILE_DOWNLOADED atau REALTIME_SCAN.' });
+  }
+  try {
+    const rawLimit = Number(req.query.limit);
+    const limit = Number.isInteger(rawLimit) && rawLimit > 0 ? rawLimit : 200;
+    const result = readActivityAuditRecords(ACTIVITY_AUDIT_DB_PATH, {
+      limit,
+      ...(typeParam ? { eventType: typeParam as ActivityAuditEventType } : {})
+    });
+    return res.json({ ...result, limit: Math.min(limit, 500), database: 'activity_audit.sqlite' });
+  } catch (err) {
+    console.error('[PASOPATI] Gagal membaca aktivitas audit:', (err as Error).message);
+    return res.status(500).json({ status: 'rejected', reason: 'Database aktivitas audit tidak dapat dibaca.' });
+  }
+});
+
 app.post('/api/admin/endpoint-health-audit/access', requireRole('admin'), rateLimit(60, 'endpoint-health-audit-access'), (req, res) => {
   const endpointId = typeof req.body?.endpointId === 'string' ? req.body.endpointId.trim() : '';
   if (!endpointId || endpointId.length > 120) {
@@ -2115,6 +2169,17 @@ app.delete('/api/audit-logs', requireRole('admin'), (_req, res) => {
   return res.json({ status: 'success', softDeleted: marked, retained: all.length });
 });
 
+// Catat setiap unduhan berkas (admin dapat melihatnya di tab Endpoint Audit →
+// Aktivitas & Akses). Dicatat saat respons selesai agar hanya unduhan sukses tercatat.
+app.use('/api/download', (req, res, next) => {
+  res.on('finish', () => {
+    if (res.statusCode >= 400) return;
+    const subject = req.path === '/project-zip' ? 'pasopati-project.zip' : path.basename(req.path);
+    recordActivity(req, 'FILE_DOWNLOADED', subject || 'unknown', `HTTP ${res.statusCode}`, 'SUCCESS');
+  });
+  next();
+});
+
 // Direct Downloads for Jury Evaluation & Field Deployment
 // Nama kanonis: pasopati_audit.py / pasopati_remediate.py.
 // /api/download/pasopati_agent.py tetap dilayani sebagai alias agar tautan lama tidak 404.
@@ -2301,7 +2366,7 @@ function runHostAuditAgent(unit: string): Promise<any> {
 
 // Live Container/Host Scan Execution — delegates to the standalone deep agent.
 // No fabricated fallback: if the agent is unavailable we fail honestly (503).
-app.post('/api/scan-host', requireRole('executor'), asyncHandler(async (req, res) => {
+app.post('/api/scan-host', requireRole('executor', 'viewer'), asyncHandler(async (req, res) => {
   const rawUnitName = (req.body && typeof req.body === 'object' ? (req.body as any).unitName : '');
   const targetUnit = String(rawUnitName || 'PASOPATI-HOST-RUNTIME').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 64);
   try {
@@ -2309,9 +2374,11 @@ app.post('/api/scan-host', requireRole('executor'), asyncHandler(async (req, res
     if (!data?.scoring) {
       throw new Error('Deep agent response is missing scoring block');
     }
+    recordActivity(req, 'REALTIME_SCAN', targetUnit, `Skor ${data.scoring.cyber_readiness_score ?? '—'}/100`, 'SUCCESS');
     return res.json(data);
   } catch (err: any) {
     console.error('[PUSKODAL-SCAN] Live host scan gagal:', err?.message || err);
+    recordActivity(req, 'REALTIME_SCAN', targetUnit, String(err?.message || 'Scan gagal').slice(0, 200), 'FAILED');
     return res.status(503).json({
       error: 'Live host scan tidak tersedia pada server ini.',
       reason: 'Deep agent subprocess gagal.',

@@ -15,7 +15,7 @@ interface TopbarProps {
   principalRole: string | null;
 }
 
-const TAB_TITLES = ['Dashboard', 'Endpoint Audit', 'Hardening & Remediation', 'Agent & Upload', 'Audit Log', 'Audit Endpoint & Kondisi'];
+const TAB_TITLES = ['Dashboard', 'Endpoint Audit', 'Hardening & Remediation', 'Agent & Upload', 'Audit Log'];
 
 export const Topbar: React.FC<TopbarProps> = ({
   activeTab,
@@ -123,6 +123,7 @@ export const Topbar: React.FC<TopbarProps> = ({
         </div>
 
         <div className="ml-auto flex items-center gap-1.5 sm:gap-3">
+          {principalRole !== 'viewer' && (
           <button
             onClick={() => {
               sfx.playClick();
@@ -138,6 +139,7 @@ export const Topbar: React.FC<TopbarProps> = ({
               </span>
             )}
           </button>
+          )}
 
           <button
             onClick={() => {
