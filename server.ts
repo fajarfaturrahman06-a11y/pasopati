@@ -1475,7 +1475,7 @@ const REMEDIATION_PLANS_PATH = path.join(DATA_DIR, 'remediation_plans.json');
 const REMEDIATION_ARTIFACTS_DIR = path.join(DATA_DIR, 'remediation_artifacts');
 
 type ArtifactKind = 'hardening' | 'rollback';
-interface StoredArtifacts { hardening: string; rollback: string; hardeningHash: string; rollbackHash: string; generatedAt: string }
+interface StoredArtifacts { hardening: string; rollback: string; hardeningHash: string; rollbackHash: string; generatedAt: string; credentials?: { apiKey?: string; hmacKey?: string } }
 
 function artifactPath(planId: string) { return path.join(REMEDIATION_ARTIFACTS_DIR, `${planId}.json`); }
 function sha256Text(text: string) { return 'sha256:' + crypto.createHash('sha256').update(text, 'utf8').digest('hex'); }
@@ -1505,6 +1505,18 @@ function readPlanArtifacts(planId: string): StoredArtifacts | null {
     console.error('[PASOPATI] Gagal membaca artefak plan:', (err as Error).message);
     return null;
   }
+}
+
+/** Simpan kredensial agent yang diisi admin saat approve (plaintext, sejajar .env). */
+function savePlanCredentials(planId: string, apiKey?: string, hmacKey?: string): void {
+  const stored = readPlanArtifacts(planId);
+  if (!stored) return;
+  const credentials = {
+    ...(apiKey ? { apiKey } : {}),
+    ...(hmacKey ? { hmacKey } : {})
+  };
+  if (Object.keys(credentials).length === 0) return;
+  writeJsonAtomic(artifactPath(planId), { ...stored, credentials: { ...stored.credentials, ...credentials } });
 }
 const ALIAS_REGEX = /^[a-z0-9][a-z0-9-]{2,47}$/;
 // Sinkron dengan ALLOWLIST_ANALISA di pasopati_audit.py (20 alias: 16 enforce + 4 advisory).
@@ -1894,6 +1906,13 @@ app.post('/api/remediation-approve', requireRole('approver'), (req, res) => {
   plan.expiresAt = Date.now() + TOKEN_TTL_MS;
   plan.evidenceDeadline = Date.now() + EVIDENCE_GRACE_MS;
   plan.signature = signPlan(plan);
+  try {
+    const apiKeyIn = typeof body.agentApiKey === 'string' ? body.agentApiKey.trim().slice(0, 200) : '';
+    const hmacIn = typeof body.agentHmacKey === 'string' ? body.agentHmacKey.trim().slice(0, 200) : '';
+    if (plan.artifacts && (apiKeyIn || hmacIn)) savePlanCredentials(plan.planId, apiKeyIn, hmacIn);
+  } catch (err) {
+    console.error('[PASOPATI] Gagal menyimpan kredensial plan:', (err as Error).message);
+  }
   plan.status = 'APPROVED';
   plan.updatedAt = new Date().toISOString();
   plansStore.set(plan.planId, plan);
@@ -2176,6 +2195,48 @@ app.post('/api/remediation-verify', requireRole('executor', 'agent'), rateLimit(
   }
   console.log(`[PUSKODAL-REMEDIATION] Plan ${plan.planId} → ${target} | device: ${plan.deviceId} | evidence: ${evidenceCount} | HMAC: valid`);
   return res.json({ status: 'success', planId: plan.planId, planStatus: target, evidenceCount });
+});
+
+// Script siap pakai untuk host target. API key master + HMAC diambil dari env server,
+// sehingga operator host tidak perlu menyalin secret. Tetap hanya untuk plan yang
+// sudah di-approve; unduhan tercatat di activity audit.
+function publicBaseUrl(req: Request): string {
+  return envValue('PASOPATI_PUBLIC_URL').replace(/\/+$/, '') || `${req.protocol}://${req.get('host')}`;
+}
+
+app.get('/api/remediation-plans/:planId/run-script', requireRole('viewer', 'executor', 'agent'), rateLimit(60, 'plan-run-script'), (req, res) => {
+  const plan = plansStore.get(String(req.params.planId || ''));
+  if (!plan) return res.status(404).json({ status: 'rejected', reason: 'Plan tidak ditemukan.' });
+  if (plan.status === 'PLANNED') return res.status(409).json({ status: 'rejected', reason: 'Plan belum di-approve; approve dulu.' });
+  const stored = readPlanArtifacts(plan.planId);
+  const apiKeyOut = stored?.credentials?.apiKey || API_KEY;
+  const hmacOut = stored?.credentials?.hmacKey || HMAC_SECRET;
+  if (!apiKeyOut || !hmacOut) return res.status(503).json({ status: 'rejected', reason: 'API key/HMAC belum tersedia; isi kolom kredensial lalu approve ulang.' });
+  const shell = String(req.query.shell || '') === 'sh' ? 'sh' : 'ps1';
+  const base = publicBaseUrl(req);
+  const python = shell === 'sh' ? 'python3' : 'python';
+  const force = plan.requiresConsoleAck ? ' --force-access-risk' : '';
+  const command = `${python} pasopati_remediate.py --server "${base}" --plan-id "${plan.planId}" --remediate-api-key "${apiKeyOut}" --hmac-key "${hmacOut}" --no-exec${force}`;
+  const header = shell === 'sh'
+    ? `#!/usr/bin/env bash\n# PASOPATI ${plan.planId} — uji aman (--no-exec).\n# Eksekusi nyata: hapus --no-exec.\nset -euo pipefail\n`
+    : `# PASOPATI ${plan.planId} — jalankan di PowerShell Administrator.\n# Ini mode uji aman (--no-exec). Eksekusi nyata: hapus --no-exec.\n`;
+  const bodyText = header + command + (shell === 'sh' ? '\n' : '\r\n');
+  recordActivity(req, 'FILE_DOWNLOADED', `${plan.planId}.run.${shell}`, `plan=${plan.planId}`, 'SUCCESS', plan.planId);
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('X-Pasopati-Plan-Status', plan.status);
+  res.setHeader('Content-Disposition', `attachment; filename="pasopati-${plan.planId}.${shell}"`);
+  return res.send(bodyText);
+});
+
+// plan.json lengkap (berisi token) untuk eksekusi offline.
+app.get('/api/remediation-plans/:planId/plan-json', requireRole('viewer', 'executor', 'agent'), rateLimit(60, 'plan-json'), (req, res) => {
+  const plan = plansStore.get(String(req.params.planId || ''));
+  if (!plan) return res.status(404).json({ status: 'rejected', reason: 'Plan tidak ditemukan.' });
+  if (!plan.nonce || !plan.signature) return res.status(409).json({ status: 'rejected', reason: 'Plan belum di-approve/token sudah tidak ada.' });
+  recordActivity(req, 'FILE_DOWNLOADED', `${plan.planId}.plan.json`, `plan=${plan.planId}`, 'SUCCESS', plan.planId);
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="${plan.planId}.plan.json"`);
+  return res.send(JSON.stringify(plan, null, 2));
 });
 
 // Jangan pernah mengembalikan nonce/signature via GET. Token hanya dikirim sekali saat approve.

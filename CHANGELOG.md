@@ -1,5 +1,16 @@
 # Changelog
 
+## Unduhan script siap pakai untuk host — 15 Nov 2026
+
+### Ditambah
+- Admin mengisi API key/HMAC di panel perintah; nilai disimpan pada artefak plan saat approve
+  (fallback ke nilai `.env` bila kolom kosong).
+- `GET /api/remediation-plans/:planId/run-script?shell=ps1|sh` menghasilkan script siap jalan
+  (berisi `--no-exec`, `--force-access-risk` bila perlu) dan `.../plan-json` untuk eksekusi offline.
+  Keduanya tercatat di activity audit dengan `planId`.
+- Tab **Endpoint Audit** menampilkan kotak unduhan untuk plan ter-approve, sehingga host
+  (viewer/executor) tidak perlu mengetik secret.
+
 ## Runbook terikat plan + mode manual — 15 Nov 2026
 
 ### Ditambah

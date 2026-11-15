@@ -1,7 +1,7 @@
 import React from 'react';
 import { DeviceInfo } from '../types';
 import { calculateDeviceScore } from '../data/mockDevices';
-import { ShieldCheck, AlertTriangle, XCircle, ArrowRight, Server, Network, UserCheck, HardDrive, Cpu, ShieldAlert, Activity, Lock, Unlock, MinusCircle, ListChecks, History } from 'lucide-react';
+import { ShieldCheck, AlertTriangle, XCircle, ArrowRight, Server, Network, UserCheck, HardDrive, Cpu, ShieldAlert, Activity, Lock, Unlock, MinusCircle, ListChecks, History, Download } from 'lucide-react';
 import { sfx } from '../utils/audio';
 import { EndpointActivityView } from './EndpointActivityView';
 
@@ -27,8 +27,27 @@ export const TabDeepAudit: React.FC<TabDeepAuditProps> = ({
   const currentDevice = (devices.find(d => d.id === selectedDeviceId) || devices[0]) as DeviceInfo;
   const [waiverBusy, setWaiverBusy] = React.useState<string | null>(null);
   const [view, setView] = React.useState<'findings' | 'activity'>('findings');
+  const [runnablePlan, setRunnablePlan] = React.useState<{ planId: string; status: string } | null>(null);
   const isAdmin = principalRole === 'admin';
   const waiversEnabled = principalRole === 'admin' || principalRole === 'planner';
+  const deviceIdForPlans = currentDevice?.id;
+
+  // Plan ter-approve untuk endpoint ini → host dapat mengunduh script langsung dari tab ini.
+  React.useEffect(() => {
+    if (!deviceIdForPlans) return;
+    let cancelled = false;
+    fetch('/api/remediation-plans', { credentials: 'same-origin' })
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => {
+        if (cancelled || !Array.isArray(d?.plans)) return;
+        const found = d.plans.find((p: any) => p.deviceId === deviceIdForPlans &&
+          (p.status === 'APPROVED' || p.status === 'EXECUTING') &&
+          (!p.evidenceDeadline || Date.now() < p.evidenceDeadline));
+        setRunnablePlan(found ? { planId: found.planId, status: found.status } : null);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [deviceIdForPlans]);
   if (!currentDevice && view === 'findings') {
     return <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-8 text-center text-sm text-slate-400">Belum ada endpoint pusat. Tambahkan endpoint dari Dashboard atau kirim telemetry agen.</div>;
   }
@@ -282,6 +301,23 @@ export const TabDeepAudit: React.FC<TabDeepAuditProps> = ({
           </div>
         </div>
       </div>
+
+      {runnablePlan && (
+        <div className="rounded-lg border border-emerald-800 bg-emerald-950/30 p-4 text-xs font-mono text-emerald-100">
+          <div className="flex flex-wrap items-center gap-2">
+            <Download className="w-4 h-4 text-emerald-300" />
+            <span>
+              Plan <strong>{runnablePlan.planId}</strong> berstatus <strong>{runnablePlan.status}</strong> — host dapat mengunduh script siap pakai (mode uji aman, tanpa mengetik kunci).
+            </span>
+          </div>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <a href={`/api/remediation-plans/${encodeURIComponent(runnablePlan.planId)}/run-script?shell=ps1`} className="px-2.5 py-1 rounded bg-emerald-800/60 border border-emerald-600 text-emerald-100 hover:bg-emerald-700/60">unduh .ps1</a>
+            <a href={`/api/remediation-plans/${encodeURIComponent(runnablePlan.planId)}/run-script?shell=sh`} className="px-2.5 py-1 rounded bg-emerald-800/60 border border-emerald-600 text-emerald-100 hover:bg-emerald-700/60">unduh .sh</a>
+            <a href={`/api/remediation-plans/${encodeURIComponent(runnablePlan.planId)}/plan-json`} className="px-2.5 py-1 rounded bg-slate-900 border border-slate-700 text-slate-200 hover:bg-slate-800">unduh plan.json</a>
+          </div>
+          <div className="mt-1 text-[10px] text-emerald-200/70">Jalankan sebagai Administrator/root. Script memakai --no-exec; hapus flag itu untuk eksekusi nyata.</div>
+        </div>
+      )}
 
       {/* Compliance Matrix Table */}
       <div className="bg-slate-900/80 border border-slate-800 rounded-lg overflow-hidden">

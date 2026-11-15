@@ -177,7 +177,10 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
     try {
       // approved.plan = plan LENGKAP sekali (berisi nonce/signature) — simpan langsung
       // untuk plan.json agent. JANGAN ambil dari GET (sudah diredaksi).
-      const approved = await approvePlan(plan.planId, ackConsole, selfApprove, force);
+      const approved = await approvePlan(plan.planId, ackConsole, selfApprove, force, {
+        agentApiKey: apiKey,
+        agentHmacKey: hmacKey
+      });
       setToken(approved.token);
       setPlan(approved.plan);
       setNowMs(Date.now());
@@ -243,8 +246,8 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
     }
   };
 
-  const downloadScript = (content: string, filename: string) => {
-    const url = URL.createObjectURL(new Blob([content], { type: 'text/plain;charset=utf-8' }));
+  const downloadText = (content: string, filename: string, mime = 'text/plain;charset=utf-8') => {
+    const url = URL.createObjectURL(new Blob([content], { type: mime }));
     const a = document.createElement('a');
     a.href = url;
     a.download = filename;
@@ -252,6 +255,8 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
     URL.revokeObjectURL(url);
     sfx.playClick();
   };
+
+  const downloadScript = (content: string, filename: string) => downloadText(content, filename);
 
   const copyText = (text: string, kind: 'plan' | 'cmd' | 'hard' | 'roll') => {
     navigator.clipboard.writeText(text);
@@ -701,13 +706,23 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
                   <FileJson className="w-3.5 h-3.5" />
                   plan.json (fallback offline)
                 </span>
-                <button
-                  onClick={() => copyText(planJsonText, 'plan')}
-                  className="flex items-center gap-1 text-[11px] font-mono text-slate-400 hover:text-rose-400"
-                >
-                  {copied === 'plan' ? <Check className="w-3.5 h-3.5 text-rose-400" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>{copied === 'plan' ? 'Tersalin' : 'Salin'}</span>
-                </button>
+                <div className="flex items-center gap-3">
+                  {plan && plan.status !== 'PLANNED' && (
+                    <a
+                      href={`/api/remediation-plans/${encodeURIComponent(plan.planId)}/plan-json`}
+                      className="text-[11px] font-mono text-rose-300 hover:text-rose-200"
+                    >
+                      unduh
+                    </a>
+                  )}
+                  <button
+                    onClick={() => copyText(planJsonText, 'plan')}
+                    className="flex items-center gap-1 text-[11px] font-mono text-slate-400 hover:text-rose-400"
+                  >
+                    {copied === 'plan' ? <Check className="w-3.5 h-3.5 text-rose-400" /> : <Copy className="w-3.5 h-3.5" />}
+                    <span>{copied === 'plan' ? 'Tersalin' : 'Salin'}</span>
+                  </button>
+                </div>
               </div>
               <pre className="p-3 text-[11px] font-mono text-slate-300 overflow-auto max-h-56 leading-relaxed">{planJsonText}</pre>
             </div>
@@ -717,13 +732,33 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
                   <Terminal className="w-3.5 h-3.5" />
                   Perintah untuk Agent (host target)
                 </span>
-                <button
-                  onClick={() => copyText(cmdText, 'cmd')}
-                  className="flex items-center gap-1 text-[11px] font-mono text-slate-400 hover:text-sky-400"
-                >
-                  {copied === 'cmd' ? <Check className="w-3.5 h-3.5 text-sky-400" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>{copied === 'cmd' ? 'Tersalin' : 'Salin'}</span>
-                </button>
+                <div className="flex items-center gap-3">
+                  {plan && plan.status !== 'PLANNED' && (
+                    <>
+                      <a
+                        href={`/api/remediation-plans/${encodeURIComponent(plan.planId)}/run-script?shell=ps1`}
+                        className="text-[11px] font-mono text-sky-300 hover:text-sky-200"
+                        title="Unduh script siap pakai (PowerShell, mode uji aman)"
+                      >
+                        unduh .ps1
+                      </a>
+                      <a
+                        href={`/api/remediation-plans/${encodeURIComponent(plan.planId)}/run-script?shell=sh`}
+                        className="text-[11px] font-mono text-sky-300 hover:text-sky-200"
+                        title="Unduh script siap pakai (bash, mode uji aman)"
+                      >
+                        unduh .sh
+                      </a>
+                    </>
+                  )}
+                  <button
+                    onClick={() => copyText(cmdText, 'cmd')}
+                    className="flex items-center gap-1 text-[11px] font-mono text-slate-400 hover:text-sky-400"
+                  >
+                    {copied === 'cmd' ? <Check className="w-3.5 h-3.5 text-sky-400" /> : <Copy className="w-3.5 h-3.5" />}
+                    <span>{copied === 'cmd' ? 'Tersalin' : 'Salin'}</span>
+                  </button>
+                </div>
               </div>
               <div className="p-3 space-y-2">
                 <div className="flex items-center gap-2 text-[11px] font-mono text-slate-400">

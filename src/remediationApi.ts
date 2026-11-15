@@ -54,9 +54,10 @@ export async function approvePlan(
   planId: string,
   acknowledgeConsole = false,
   selfApprove = false,
-  force = false
+  force = false,
+  credentials?: { agentApiKey?: string; agentHmacKey?: string }
 ): Promise<{ planId: string; nonce: string; expiresAt: number; signature: string; token: string; plan: RemediationPlan }> {
-  return postJson('/api/remediation-approve', { planId, acknowledgeConsole, selfApprove, force });
+  return postJson('/api/remediation-approve', { planId, acknowledgeConsole, selfApprove, force, ...credentials });
 }
 
 export interface WhoAmI {
