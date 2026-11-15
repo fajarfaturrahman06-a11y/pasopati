@@ -172,16 +172,18 @@ Tanpa `--push-url`, hasil hanya tersimpan lokal di `audit.json` dan bisa diungga
 1. **Langkah 3**: pilih mode **agent**.
 2. Opsional ikat ke host ter-enrol.
 3. Jika plan menyentuh SSH/firewall/RDP: siapkan konsol/KVM lalu centang konfirmasi.
-4. **BUAT PLAN** → **APPROVE PLAN** (operator lain; jika Anda pembuatnya centang “setujui sendiri”).
+4. **BUAT PLAN**.
+
 5. Isi **API key** dan **HMAC key** lalu klik **SIMPAN & KIRIM SCRIPT KE ENDPOINT**. Script langsung muncul di tab **Endpoint Audit** untuk host tersebut (masih menunggu approve sebelum bisa diunduh).
-6. Approve plan. Token tampil **sekali** dan berlaku 10 menit.
+
+6. **APPROVE PLAN** (operator lain; jika Anda pembuatnya centang “setujui sendiri”). Token tampil **sekali** dan berlaku 10 menit.
 7. Jika host masih punya plan aktif, panel menampilkan plan penghalang: selesaikan/rollback, atau **APPROVE PAKSA**.
 
 ### 7.4 Jalankan di host
 
 Host (viewer/executor) membuka **Endpoint Audit** pada endpoint tersebut. Muncul kotak hijau plan ter-approve dengan tombol **unduh .ps1 / .sh / plan.json** — kuncinya sudah terisi, tidak perlu mengetik.
 
-Setelah diunduh, jalankan di host target (PowerShell Administrator) sebagai uji aman (script sudah memakai `--no-exec`).
+Setelah diunduh, jalankan di host target (PowerShell Administrator) sebagai uji aman (script sudah memakai `--no-exec`). Jika ingin menyalin perintah manual, contohnya:
 
 ```powershell
 python pasopati_remediate.py `
