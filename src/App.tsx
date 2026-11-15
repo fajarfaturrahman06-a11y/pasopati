@@ -11,23 +11,76 @@ import { TabDeepAudit } from './components/TabDeepAudit';
 import { TabAIHardening } from './components/TabAIHardening';
 import { TabLiveAgent } from './components/TabLiveAgent';
 import { TabAuditLog } from './components/TabAuditLog';
+import { TabEndpointHealthAudit } from './components/TabEndpointHealthAudit';
+import { LoginGate, type PrincipalIdentity } from './components/LoginGate';
+import { OperatorTestAccess } from './components/OperatorTestAccess';
 import { INITIAL_MOCK_DEVICES, calculateFleetScore, calculateDeviceScore } from './data/mockDevices';
 import { DeviceInfo, AuditLogEntry } from './types';
 import { normalizeAuditAction } from './auditActions';
 import { sfx } from './utils/audio';
 import { FileText, Download, Copy, Check, X, ShieldAlert } from 'lucide-react';
+import type { EndpointSyncStatus, EndpointDraftPayload } from './components/EndpointRegistryPanel';
 
 // Audit trail starts empty — entries are recorded only from real actions
 // (remediation, quarantine, telemetry ingestion) during this session.
 const INITIAL_AUDIT_LOGS: AuditLogEntry[] = [];
 
+function cloneDemoDevices(): DeviceInfo[] {
+  return JSON.parse(JSON.stringify(INITIAL_MOCK_DEVICES)) as DeviceInfo[];
+}
+
+function normalizeEndpointDevice(raw: any): DeviceInfo {
+  const checks = Array.isArray(raw?.checks) ? raw.checks : [];
+  const platform = ['linux', 'windows', 'embedded'].includes(String(raw?.platformType)) ? raw.platformType : 'linux';
+  return {
+    id: String(raw?.id || ''),
+    revision: Number.isSafeInteger(raw?.revision) && raw.revision > 0 ? raw.revision : 1,
+    ...(typeof raw?.agentId === 'string' ? { agentId: raw.agentId } : {}),
+    name: String(raw?.name || raw?.hostname || 'Endpoint'),
+    hostname: String(raw?.hostname || ''),
+    role: String(raw?.role || 'Endpoint'),
+    os: String(raw?.os || 'Unknown'),
+    platformType: platform,
+    ip: String(raw?.ip || ''),
+    mac: String(raw?.mac || ''),
+    user: String(raw?.user || ''),
+    openPorts: Array.isArray(raw?.openPorts) ? raw.openPorts.filter((port: unknown) => Number.isInteger(Number(port))).map(Number) : [],
+    checks: checks.map((check: any, index: number) => ({
+      id: String(check?.id || `check-${index + 1}`),
+      parameter: String(check?.parameter || 'Security control'),
+      category: String(check?.category || 'Network & Port') as DeviceInfo['checks'][number]['category'],
+      cis_id: String(check?.cis_id || ''),
+      status: (['PASS', 'WARNING', 'FAIL', 'N/A', 'WAIVED'].includes(String(check?.status)) ? String(check.status) : 'N/A') as DeviceInfo['checks'][number]['status'],
+      details: String(check?.details || ''),
+      mitigation: String(check?.mitigation || '')
+    })),
+    isQuarantined: raw?.isQuarantined === true,
+    history: Array.isArray(raw?.history) ? raw.history.map((point: any) => ({
+      timestamp: String(point?.timestamp || ''),
+      score: Number(point?.score) || 0,
+      passCount: Number(point?.passCount) || 0,
+      warnCount: Number(point?.warnCount) || 0,
+      failCount: Number(point?.failCount) || 0,
+      event: String(point?.event || '')
+    })) : []
+  };
+}
+
 export default function App() {
-  const [devices, setDevices] = useState<DeviceInfo[]>(() => JSON.parse(JSON.stringify(INITIAL_MOCK_DEVICES)));
+  const [devices, setDevices] = useState<DeviceInfo[]>(cloneDemoDevices);
+  const [centralEndpointData, setCentralEndpointData] = useState(false);
+  const [endpointSyncStatus, setEndpointSyncStatus] = useState<EndpointSyncStatus>('demo');
+  const [lastEndpointSync, setLastEndpointSync] = useState<string | null>(null);
+  const [principalRole, setPrincipalRole] = useState<string | null>(null);
+  const [principalName, setPrincipalName] = useState<string | null>(null);
+  const [loginNotice, setLoginNotice] = useState<string | null>(null);
+  const [showOperatorTestAccess, setShowOperatorTestAccess] = useState(false);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>('SRV-DATA-YONIF');
   const [activeTab, setActiveTab] = useState<number>(0);
   const [mobileOpen, setMobileOpen] = useState<boolean>(false);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
-  const [userApiKey, setUserApiKey] = useState<string>('');
+  const [sessionActive, setSessionActive] = useState(false);
+  const [authReady, setAuthReady] = useState(false);
   const [geminiKey, setGeminiKey] = useState<string>('');
   const [lastScanTime, setLastScanTime] = useState<string>(() => {
     const now = new Date();
@@ -38,18 +91,35 @@ export default function App() {
   const [copiedReport, setCopiedReport] = useState<boolean>(false);
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>(INITIAL_AUDIT_LOGS);
   const toastTimerRef = useRef<number | null>(null);
+  const endpointSyncRef = useRef<() => Promise<void>>(async () => undefined);
+  const centralEndpointDataRef = useRef(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/auth/session', { credentials: 'same-origin', cache: 'no-store' })
+      .then(response => response.ok ? response.json() : { authenticated: false })
+      .then(identity => {
+        if (cancelled) return;
+        if (identity?.authenticated && typeof identity.name === 'string' && typeof identity.role === 'string') {
+          setPrincipalName(identity.name);
+          setPrincipalRole(identity.role);
+          setSessionActive(true);
+        }
+      })
+      .catch(() => {})
+      .finally(() => { if (!cancelled) setAuthReady(true); });
+    return () => { cancelled = true; };
+  }, []);
 
   const handleDirectDownload = async (fileName: string, url: string) => {
     sfx.playSuccess();
     const protectedDownload = url.includes('/api/download/project-zip');
     showToast(`Menyiapkan unduhan ${fileName}... (Akses Langsung Evaluasi Juri)`, 'info');
     try {
-      const response = await fetch(url, {
-        headers: userApiKey.trim() ? { 'X-Pasopati-API-Key': userApiKey.trim() } : {}
-      });
+      const response = await fetch(url, { credentials: 'same-origin' });
       if (!response.ok) {
         if (protectedDownload && (response.status === 401 || response.status === 503)) {
-          showToast('Unduhan ZIP butuh X-Pasopati-API-Key valid. Isi API key operasional di tab Audit Log / AI Hardening.', 'info');
+          showToast('Sesi login tidak lagi berlaku. Masuk kembali dengan username dan password.', 'info');
           return;
         }
         throw new Error(`HTTP ${response.status}`);
@@ -66,7 +136,7 @@ export default function App() {
       showToast(`Berkas ${fileName} berhasil diunduh.`, 'success');
     } catch (err) {
       if (protectedDownload) {
-        showToast(`Gagal mengunduh ${fileName}. Periksa koneksi dan API key.`, 'info');
+        showToast(`Gagal mengunduh ${fileName}. Periksa koneksi server.`, 'info');
         return;
       }
       console.warn('Fetch blob download fallback to native navigation:', err);
@@ -82,10 +152,8 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-    const url = '/api/audit-logs';
-    fetch(url, {
-      headers: userApiKey.trim() ? { 'X-Pasopati-API-Key': userApiKey.trim() } : {}
-    })
+    if (!sessionActive) return () => { cancelled = true; };
+    fetch('/api/audit-logs', { credentials: 'same-origin', cache: 'no-store' })
       .then((r) => (r.ok ? r.json() : { logs: [] }))
       .then((d) => {
         if (cancelled) return;
@@ -106,21 +174,88 @@ export default function App() {
               changesSummary: String(l.changesSummary || ''),
               changesDetails: Array.isArray(l.changesDetails) ? l.changesDetails.filter((x: any) => typeof x === 'string').map((x: any) => String(x)) : [],
               status: (['SUCCESS', 'WARNING', 'FAILED'].includes(String(l.status)) ? String(l.status) : 'SUCCESS') as AuditLogEntry['status'],
-              storedInDb: true
+              storedInDb: true,
+              ...(typeof l.deletedAt === 'string' ? { deletedAt: l.deletedAt } : {})
             }))
         );
       })
       .catch(() => {});
+    return () => { cancelled = true; };
+  }, [sessionActive]);
+
+  // Satu sumber data endpoint untuk seluruh halaman: server VPS. Mock hanya
+  // ditampilkan dalam mode demo sampai browser berhasil terautentikasi.
+  useEffect(() => {
+    let cancelled = false;
+    let inFlight = false;
+    let pollTimer: number | null = null;
+    let startTimer: number | null = null;
+
+    if (!sessionActive) {
+      centralEndpointDataRef.current = false;
+      setCentralEndpointData(false);
+      setEndpointSyncStatus('demo');
+      setLastEndpointSync(null);
+      setPrincipalRole(null);
+      setPrincipalName(null);
+      setDevices(cloneDemoDevices());
+      setSelectedDeviceId('SRV-DATA-YONIF');
+      endpointSyncRef.current = async () => undefined;
+      return () => { cancelled = true; };
+    }
+
+    setEndpointSyncStatus('connecting');
+    const sync = async () => {
+      if (cancelled || inFlight) return;
+      inFlight = true;
+      try {
+        const response = await fetch('/api/endpoints', { credentials: 'same-origin', cache: 'no-store' });
+        if (response.status === 401 || response.status === 403) {
+          centralEndpointDataRef.current = false;
+          setCentralEndpointData(false);
+          setDevices(cloneDemoDevices());
+          setSelectedDeviceId('SRV-DATA-YONIF');
+          setPrincipalRole(null);
+          setPrincipalName(null);
+          setEndpointSyncStatus('unauthenticated');
+          setLoginNotice('Sesi login berakhir. Masuk kembali dengan username dan password.');
+          setSessionActive(false);
+          return;
+        }
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        if (!Array.isArray(data?.endpoints)) throw new Error('Response endpoint tidak valid.');
+        const latest: DeviceInfo[] = data.endpoints.map(normalizeEndpointDevice) as DeviceInfo[];
+        if (cancelled) return;
+        centralEndpointDataRef.current = true;
+        setCentralEndpointData(true);
+        setDevices(latest);
+        setSelectedDeviceId(current => latest.some(device => device.id === current) ? current : (latest[0]?.id || ''));
+        setEndpointSyncStatus('connected');
+        setLastEndpointSync(new Date().toLocaleTimeString());
+      } catch {
+        if (!cancelled) setEndpointSyncStatus('offline');
+      } finally {
+        inFlight = false;
+      }
+    };
+    endpointSyncRef.current = sync;
+    startTimer = window.setTimeout(() => {
+      void sync();
+      pollTimer = window.setInterval(() => void sync(), 5000);
+    }, 350);
     return () => {
       cancelled = true;
+      if (startTimer !== null) window.clearTimeout(startTimer);
+      if (pollTimer !== null) window.clearInterval(pollTimer);
     };
-  }, [userApiKey]);
+  }, [sessionActive]);
 
-  // Pulihkan status karantina dari registry server setelah reload / ganti API key.
+  // Pulihkan status karantina dari registry server setelah pemulihan sesi.
   useEffect(() => {
-    if (!userApiKey.trim()) return;
+    if (!sessionActive) return;
     let cancelled = false;
-    fetch('/api/quarantine', { headers: { 'X-Pasopati-API-Key': userApiKey.trim() } })
+    fetch('/api/quarantine', { credentials: 'same-origin' })
       .then(r => (r.ok ? r.json() : null))
       .then(d => {
         if (cancelled || !d?.units) return;
@@ -130,16 +265,14 @@ export default function App() {
         }));
       })
       .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [userApiKey]);
+    return () => { cancelled = true; };
+  }, [sessionActive]);
 
   const persistAuditLogs = (entries: AuditLogEntry[]) => {
     if (entries.length === 0) return;
     fetch('/api/audit-logs', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...(userApiKey.trim() ? { 'X-Pasopati-API-Key': userApiKey.trim() } : {}) },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ logs: entries })
     }).catch(() => {});
   };
@@ -186,7 +319,7 @@ export default function App() {
     try {
       const res = await fetch('/api/quarantine', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...(userApiKey.trim() ? { 'X-Pasopati-API-Key': userApiKey.trim() } : {}) },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ unitId: deviceId, action: nextQuarantine ? 'LOCK' : 'RELEASE' })
       });
       const quarantineAck = await res.json().catch(() => null);
@@ -233,45 +366,92 @@ export default function App() {
     }
   };
 
-  // Add uploaded device from CLI agent
-  const handleAddUploadedDevice = (newDevice: DeviceInfo) => {
-    setDevices(prev => {
-      const filtered = prev.filter(d => d.id !== newDevice.id);
-      return [newDevice, ...filtered];
-    });
-    setSelectedDeviceId(newDevice.id);
-
-    // Record Telemetry Ingestion Log
-    const newLog: AuditLogEntry = {
-      id: `LOG-ING-${Date.now()}`,
-      timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC',
-      deviceId: newDevice.id,
-      deviceName: newDevice.name,
-      deviceRole: newDevice.role,
-      action: 'TELEMETRY INGESTION',
-        operator: 'pasopati_cli_agent',
-      preScore: 0,
-      postScore: calculateDeviceScore(newDevice.checks),
-      changesSummary: `Penerimaan telemetri audit dari agen mandiri (${newDevice.hostname} / ${newDevice.ip}).`,
-      changesDetails: newDevice.checks.filter(c => c.status === 'FAIL').map(c => `FAIL: ${c.parameter}`),
-      status: 'SUCCESS',
-        storedInDb: true
-    };
-
-    setAuditLogs(prev => [newLog, ...prev]);
-    persistAuditLogs([newLog]);
-    showToast(`Telemetri impor ${newDevice.name} dimuat ke armada (data berasal dari file JSON, bukan scan langsung).`, 'info');
-
-    // Riwayat drift dari server (bila unit ini pernah mengirim telemetri bertanda tangan).
-    if (userApiKey.trim()) {
-      fetch('/api/compliance-drift/' + encodeURIComponent(newDevice.id), { headers: { 'X-Pasopati-API-Key': userApiKey.trim() } })
-        .then(r => (r.ok ? r.json() : null))
-        .then(d => {
-          if (!Array.isArray(d?.history) || d.history.length === 0) return;
-          setDevices(prev => prev.map(dev => (dev.id === newDevice.id ? { ...dev, history: d.history } : dev)));
-        })
-        .catch(() => {});
+  // Terapkan/lepas waiver aktif ke daftar temuan perangkat.
+  const refreshWaivers = async (deviceId: string) => {
+    if (!sessionActive) return;
+    try {
+      const res = await fetch('/api/waivers/' + encodeURIComponent(deviceId), {
+        credentials: 'same-origin'
+      });
+      if (!res.ok) return;
+      const data = await res.json().catch(() => null);
+      const list: any[] = Array.isArray(data?.waivers) ? data.waivers : [];
+      setDevices(prev => prev.map(dev => {
+        if (dev.id !== deviceId) return dev;
+        return {
+          ...dev,
+          checks: dev.checks.map(c => {
+            const waiver = list.find((w: any) => w?.parameter === c.parameter);
+            if (waiver) {
+              return { ...c, baseStatus: c.baseStatus ?? c.status, status: 'WAIVED' as const, waiver };
+            }
+            if (c.waiver) {
+              return { ...c, status: (c.baseStatus ?? 'WARNING') as typeof c.status, waiver: undefined, baseStatus: undefined };
+            }
+            return c;
+          })
+        };
+      }));
+    } catch {
+      /* abaikan */
     }
+  };
+
+  const saveEndpoint = async (payload: EndpointDraftPayload, id?: string, expectedRevision?: number) => {
+    if (!sessionActive || !centralEndpointDataRef.current) throw new Error('Sesi login atau koneksi registry VPS tidak tersedia.');
+    const response = await fetch(id ? `/api/endpoints/${encodeURIComponent(id)}` : '/api/endpoints', {
+      method: id ? 'PUT' : 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(id ? { ...payload, expected_revision: expectedRevision } : payload)
+    });
+    const result = await response.json().catch(() => null);
+    if (response.status === 409 && id) {
+      await endpointSyncRef.current();
+      throw new Error(`${String(result?.reason || 'Konflik perubahan endpoint.')} Daftar sudah diperbarui; tutup dan buka kembali formulir edit sebelum menyimpan lagi.`);
+    }
+    if (!response.ok) throw new Error(String(result?.reason || `HTTP ${response.status}`));
+    await endpointSyncRef.current();
+    if (result?.endpoint?.id) setSelectedDeviceId(String(result.endpoint.id));
+    showToast(id ? 'Perubahan endpoint tersimpan di registry VPS.' : (result?.created ? 'Endpoint tersimpan di registry VPS.' : 'Endpoint cocok diperbarui di registry VPS.'));
+  };
+
+  const deleteEndpoint = async (id: string) => {
+    if (!sessionActive || !centralEndpointDataRef.current) throw new Error('Koneksi registry VPS tidak tersedia.');
+    const response = await fetch(`/api/endpoints/${encodeURIComponent(id)}`, {
+      method: 'DELETE', credentials: 'same-origin'
+    });
+    const result = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(String(result?.reason || `HTTP ${response.status}`));
+    await endpointSyncRef.current();
+    showToast('Endpoint diarsipkan; rekam jejak tetap tersimpan.');
+  };
+
+  // Sample stays local/demo; operational scan or JSON upload must be saved at VPS.
+  const handleAddUploadedDevice = async (newDevice: DeviceInfo, source: 'agent' | 'demo' = 'agent') => {
+    if (source === 'demo') {
+      if (centralEndpointDataRef.current) {
+        showToast('Contoh demo tidak ditambahkan ke inventaris VPS.', 'info');
+        return;
+      }
+      setDevices(prev => [newDevice, ...prev.filter(device => device.id !== newDevice.id)]);
+      setSelectedDeviceId(newDevice.id);
+      showToast(`Contoh ${newDevice.name} hanya dimuat dalam sesi demo.`, 'info');
+      return;
+    }
+    if (!sessionActive || !centralEndpointDataRef.current) throw new Error('Sesi login dan koneksi registry VPS diperlukan untuk menyimpan ke VPS.');
+    const response = await fetch('/api/endpoints', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...newDevice, agentId: newDevice.agentId || newDevice.id, source: undefined })
+    });
+    const result = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(String(result?.reason || `HTTP ${response.status}`));
+    await endpointSyncRef.current();
+    if (result?.endpoint?.id) {
+      setSelectedDeviceId(String(result.endpoint.id));
+      void refreshWaivers(String(result.endpoint.id));
+    }
+    showToast(`Hasil audit ${newDevice.name} tersimpan di registry VPS (upload/import, bukan bukti scan langsung).`, 'info');
   };
 
   // Build official military commander briefing report text
@@ -390,8 +570,38 @@ export default function App() {
     showToast('Laporan Resmi (.md) Berhasil Diunduh!');
   };
 
+  const handleAuthenticated = (identity: PrincipalIdentity) => {
+    setLoginNotice(null);
+    setPrincipalName(identity.name);
+    setPrincipalRole(identity.role);
+    setActiveTab(0);
+    setSessionActive(true);
+    setAuthReady(true);
+  };
+
+  const handleLogout = () => {
+    void fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' }).catch(() => {});
+    setSessionActive(false);
+    setPrincipalName(null);
+    setPrincipalRole(null);
+    setShowOperatorTestAccess(false);
+    setActiveTab(0);
+  };
+
+  if (!authReady) {
+    return <main className="hud-grid flex min-h-screen items-center justify-center text-sm text-slate-400">Memeriksa sesi PASOPATI…</main>;
+  }
+
+  if (!sessionActive) {
+    return <LoginGate onAuthenticated={handleAuthenticated} notice={loginNotice} />;
+  }
+
   return (
     <div className="min-h-screen bg-[#12151c] text-slate-100 selection:bg-rose-500 selection:text-white">
+
+      {showOperatorTestAccess && principalRole === 'admin' && (
+        <OperatorTestAccess onClose={() => setShowOperatorTestAccess(false)} />
+      )}
 
       <Sidebar
         activeTab={activeTab}
@@ -403,6 +613,10 @@ export default function App() {
         onDownloadProjectZip={() => handleDirectDownload('pasopati-project.zip', '/api/download/project-zip')}
         mobileOpen={mobileOpen}
         onCloseMobile={() => setMobileOpen(false)}
+        principalRole={principalRole}
+        principalName={principalName}
+        onLogout={handleLogout}
+        onCreateTestUser={() => setShowOperatorTestAccess(true)}
       />
 
       <div className="flex min-h-screen flex-col lg:pl-[268px]">
@@ -413,15 +627,18 @@ export default function App() {
           onOpenMobile={() => setMobileOpen(true)}
           onSelectDevice={handleSelectDevice}
           onNavigate={setActiveTab}
+          principalName={principalName}
+          principalRole={principalRole}
         />
 
         {/* Demo-vs-live honesty banner */}
-        <div className="border-b border-amber-900/40 bg-amber-950/20">
-          <div className="mx-auto flex max-w-[1600px] items-start gap-2 px-4 py-1.5 font-mono text-[10.5px] text-amber-300/90 sm:items-center sm:px-6">
+        <div className={`border-b ${centralEndpointData ? 'border-emerald-900/40 bg-emerald-950/15' : 'border-amber-900/40 bg-amber-950/20'}`}>
+          <div className={`mx-auto flex max-w-[1600px] items-start gap-2 px-4 py-1.5 font-mono text-[10.5px] sm:items-center sm:px-6 ${centralEndpointData ? 'text-emerald-200/90' : 'text-amber-300/90'}`}>
             <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 sm:mt-0" />
             <span>
-              MODE DEMO: data armada awal adalah mock. Audit/Hardening di dashboard hanya mengubah status simulasi.
-              Eksekusi host nyata hanya melalui tab Hardening &amp; Remediation + pasopati_remediate.py di host target.
+              {centralEndpointData
+                ? `MODE VPS: inventaris endpoint berasal dari server pusat${endpointSyncStatus === 'offline' ? ' (data terakhir tersimpan; VPS sedang tidak terjangkau)' : ''} dan dipoll tiap 5 detik. Audit/Hardening visual tidak menjalankan host; eksekusi nyata hanya melalui agen remediation di host target.`
+                : 'MODE DEMO: data armada awal adalah mock lokal, bukan inventaris VPS. Masuk dengan akun terdaftar untuk memuat registry pusat. Audit/Hardening visual tidak menjalankan host.'}
             </span>
           </div>
         </div>
@@ -448,6 +665,13 @@ export default function App() {
               showToast('Audit Taktis Armada Selesai.');
             }}
             onNavigate={setActiveTab}
+            endpointSyncStatus={endpointSyncStatus}
+            centralEndpointData={centralEndpointData}
+            canManageEndpoints={principalRole === 'admin' || principalRole === 'planner'}
+            canDeleteEndpoints={principalRole === 'admin'}
+            lastEndpointSync={lastEndpointSync}
+            onSaveEndpoint={saveEndpoint}
+            onDeleteEndpoint={deleteEndpoint}
           />
         )}
 
@@ -458,6 +682,8 @@ export default function App() {
             onSelectDevice={setSelectedDeviceId}
             onNavigateToHardening={handleNavigateToHardening}
             onToggleQuarantine={handleToggleQuarantine}
+            principalRole={principalRole}
+            onWaiversChanged={refreshWaivers}
           />
         )}
 
@@ -466,8 +692,8 @@ export default function App() {
             devices={devices}
             selectedDeviceId={selectedDeviceId}
             onSelectDevice={setSelectedDeviceId}
-            userApiKey={userApiKey}
-            setUserApiKey={setUserApiKey}
+            principalName={principalName}
+            principalRole={principalRole}
             geminiKey={geminiKey}
             setGeminiKey={setGeminiKey}
             onShowToast={showToast}
@@ -482,7 +708,6 @@ export default function App() {
               setActiveTab(1);
             }}
             onDownloadFile={handleDirectDownload}
-            apiKey={userApiKey}
           />
         )}
 
@@ -491,8 +716,16 @@ export default function App() {
             logs={auditLogs}
             onLogsUpdated={setAuditLogs}
             onShowToast={showToast}
-            apiKey={userApiKey}
           />
+        )}
+
+        {activeTab === 5 && principalRole === 'admin' && (
+          <TabEndpointHealthAudit devices={devices} />
+        )}
+        {activeTab === 5 && principalRole !== 'admin' && (
+          <div className="rounded-xl border border-rose-900/50 bg-rose-950/20 p-5 text-sm text-rose-200">
+            Fitur Audit Endpoint &amp; Kondisi hanya tersedia untuk administrator.
+          </div>
         )}
 
       </main>

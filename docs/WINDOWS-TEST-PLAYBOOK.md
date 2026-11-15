@@ -12,7 +12,7 @@ dari Command Center yang berjalan di mesin server (WSL) — tanpa menyentuh mesi
 
 | Peran | Mesin | Yang dijalankan |
 |---|---|---|
-| Server | Mesin ber-WSL (repo di folder `satria-guard`) | `npm run dev`, `setup-lan.ps1` (PowerShell **Administrator**) |
+| Server | Mesin ber-WSL (repo di `D:\pasopati`) | `npm run dev`, `setup-lan.ps1` (PowerShell **Administrator**) |
 | Target | Laptop uji Windows (satu LAN) | `pasopati_audit.py`, lalu `pasopati_remediate.py` |
 
 Server mengikat `0.0.0.0:3000`. `setup-lan.ps1` membuat portproxy Windows→WSL +
@@ -33,7 +33,7 @@ rule firewall, sehingga laptop target mengakses **IP LAN Windows**, bukan IP WSL
 Di mesin server:
 
 ```bash
-cd satria-guard
+cd /mnt/d/pasopati
 grep -E '^(PASOPATI_API_KEY|HMAC_SECRET)=' .env   # pastikan terisi (64 karakter)
 npm run dev
 ```
@@ -41,7 +41,7 @@ npm run dev
 Lalu di **PowerShell Administrator** mesin server (bukan target):
 
 ```powershell
-cd satria-guard
+cd D:\pasopati
 powershell -ExecutionPolicy Bypass -File .\setup-lan.ps1
 ipconfig    # catat IPv4 LAN, mis. 192.168.1.20
 ```
@@ -100,21 +100,36 @@ Admin key tidak diperlukan untuk audit read-only.
    - `guest-account-disable`
    - `win-auditpol-process`
    - (hindari dulu: `bitlocker-enable`, `rdp-nla-enable`, `ports-block-windows`)
-4. **Buat Plan** → **Approve** → salin perintah yang muncul (berisi `--plan-id`).
-5. Di laptop, jalankan **persis perintah itu** dengan tambahan `--no-exec`:
+4. (Opsional, disarankan) Enrol laptop sebagai host di server:
+   ```powershell
+   curl -X POST http://<server>:3000/api/hosts/enroll -H "X-Pasopati-API-Key: <API_KEY>" `
+     -H "Content-Type: application/json" -d '{\"name\":\"LAPTOP-UJI-WIN\"}'
+   ```
+   Simpan `hostKey`; pakai `--host-key "<hostKey>"` di agent dan pilih host itu saat membuat plan.
+5. **Buat Plan** → **Approve** (centang konfirmasi akses & self-approve bila perlu) → salin perintah yang muncul (berisi `--plan-id`).
+6. Di laptop, jalankan **persis perintah itu** dengan tambahan `--no-exec` (sertakan `--host-key` bila host diikat):
 
 ```powershell
 py -3 .\pasopati_remediate.py --server "http://192.168.1.20:3000" --plan-id "PLAN-..." `
-  --remediate-api-key "<API_KEY>" --hmac-key "<HMAC_SECRET>" --no-exec
+  --remediate-api-key "<API_KEY>" --hmac-key "<HMAC_SECRET>" --host-key "<HOST_KEY>" --no-exec
 ```
 
 `--no-exec` memvalidasi token, signature, dan menampilkan pre-state tanpa mengubah host.
 
-6. Setelah yakin, jalankan ulang **tanpa** `--no-exec`. Script otomatis meminta UAC.
-7. Status plan berubah: `VERIFIED` / `ROLLED_BACK` / `FAILED`; evidence bertanda tangan
-   HMAC terlihat di panel dan audit log.
+7. Setelah yakin, jalankan ulang **tanpa** `--no-exec`. Script otomatis meminta UAC.
+   Bila sesi ini RDP dan plan memblokir RDP, tambahkan `--force-access-risk` (setelah menyiapkan konsol).
+   Dead-man otomatis aktif 600 detik; host rollback sendiri bila hasil tidak final.
+8. Status plan berubah: `VERIFIED` / `ROLLED_BACK` / `FAILED`; evidence bertanda tangan
+   HMAC terlihat di panel dan audit log. `VERIFIED` baru diterima bila audit ulang bersih.
 
 > Bukti ber-status `TERVERIFIKASI NYATA` hanya muncul dari evidence agent, bukan simulasi.
+
+> Dead-man: boleh diuji dengan `--deadman-seconds 60`. Batalkan manual dengan membuat file
+> `%USERPROFILE%\.pasopati\backups\<PLAN_ID>.confirmed` bila perlu.
+
+> Bila proses mati di tengah jalan, plan tetap `EXECUTING` dan heartbeat-nya basi. Lanjutkan
+> dengan `--resume` (langkah yang sudah terverifikasi dilewati), atau minta operator approve ulang
+> dengan `overrideQueue=true`.
 
 ## 7. Yang perlu diperiksa setelah eksekusi
 
@@ -155,7 +170,7 @@ Catat: `blockoutbound` memutus koneksi baru ke server; gunakan console lokal.
 | UAC tidak muncul / script berhenti | Jalankan PowerShell sebagai Administrator, atau pakai `--no-elevate` untuk audit. |
 | `ExecutionPolicy` memblokir `.ps1` | `powershell -ExecutionPolicy Bypass -File .\setup-lan.ps1`. |
 | BitLocker lama | Enkripsi berjalan background; cek `manage-bde -status C:` dan simpan recovery key. |
-| Koneksi RDP putus setelah `ports-block-windows` | Rule memblokir koneksi RDP **baru** ke 3389; sambungkan ulang setelah sesi lama selesai. |
+| Koneksi RDP putus setelah `ports-block-windows` | Rule `PASOPATI-Block-3389` **memblokir RDP masuk** (bukan hanya sesi baru). Akses hanya pulih via konsol/KVM atau dengan menghapus rule dari sesi lokal. |
 
 ## 10. Bersih-bersih
 

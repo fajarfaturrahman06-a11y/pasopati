@@ -27,7 +27,7 @@ export function aliasForCheck(device: DeviceInfo, parameter: string, details: st
   if (text.includes('uac')) return isWindows ? 'uac-enable' : null;
   if (text.includes('ssh') && text.includes('root')) return isWindows ? null : 'ssh-disable-root';
   if (text.includes('auditd') || text.includes('audit daemon') || text.includes('syslog')) return isWindows ? null : 'auditd-enable';
-  if (text.includes('event log') || text.includes('auditing')) return isWindows ? 'win-auditpol-process' : null;
+  if (text.includes('event log') || text.includes('auditing') || text.includes('process creation')) return isWindows ? 'win-auditpol-process' : null;
   if (text.includes('firewall') || text.includes('ufw') || text.includes('defender')) {
     return isWindows ? 'fw-enable-defender' : 'fw-enable-ufw';
   }
@@ -36,6 +36,7 @@ export function aliasForCheck(device: DeviceInfo, parameter: string, details: st
 
 /** Temuan yang masih layak diremediasi (termasuk yang baru disimulasikan di dashboard). */
 export function isRemediableCheck(check: SecurityCheck): boolean {
+  if (check.status === 'WAIVED') return check.details.includes('[SIMULASI');
   return check.status === 'FAIL' || check.status === 'WARNING' || check.details.includes('[SIMULASI');
 }
 

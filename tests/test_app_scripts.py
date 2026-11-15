@@ -78,7 +78,9 @@ class AppScriptTests(unittest.TestCase):
             f.write(hard)
             path = f.name
         try:
-            subprocess.run(["bash", "-n", path], check=True, capture_output=True)
+            # stdin: path Windows tidak perlu diterjemahkan bila bash adalah WSL.
+            # Kirim bytes agar tidak diterjemahkan ke CRLF.
+            subprocess.run(["bash", "-n"], input=hard.encode("utf-8"), check=True, capture_output=True)
         finally:
             os.unlink(path)
 

@@ -11,7 +11,8 @@ import {
   VolumeX,
   X,
   ShieldCheck,
-  Radio
+  Radio,
+  Database
 } from 'lucide-react';
 import { sfx } from '../utils/audio';
 
@@ -25,6 +26,10 @@ interface SidebarProps {
   onDownloadProjectZip?: () => void;
   mobileOpen: boolean;
   onCloseMobile: () => void;
+  principalRole: string | null;
+  principalName: string | null;
+  onLogout: () => void;
+  onCreateTestUser: () => void;
 }
 
 const MENU = [
@@ -32,7 +37,8 @@ const MENU = [
   { id: 1, label: 'Endpoint Audit', icon: MonitorSmartphone },
   { id: 2, label: 'Hardening & Remediation', icon: Wrench },
   { id: 3, label: 'Agent & Upload', icon: UploadCloud },
-  { id: 4, label: 'Audit Log', icon: ScrollText }
+  { id: 4, label: 'Audit Log', icon: ScrollText },
+  { id: 5, label: 'Audit Endpoint & Kondisi', icon: Database }
 ];
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -44,7 +50,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onExportCommanderReport,
   onDownloadProjectZip,
   mobileOpen,
-  onCloseMobile
+  onCloseMobile,
+  principalRole,
+  principalName,
+  onLogout,
+  onCreateTestUser
 }) => {
   const defcon =
     fleetScore >= 80
@@ -101,7 +111,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </div>
 
         {/* Operator identity */}
-        <div className="mx-4 mb-5 flex items-center gap-3 rounded-xl border border-[#252b37] bg-[#12161e] px-3 py-3">
+        <div className="mx-4 mb-3 flex items-center gap-3 rounded-xl border border-[#252b37] bg-[#12161e] px-3 py-3">
           <div className="relative">
             <span className="flex h-10 w-10 items-center justify-center overflow-hidden rounded-full border border-[#343b49] bg-[#0b0e14]">
               <img src="/pasopati-mark.png" alt="" className="h-10 w-10 object-cover" />
@@ -109,10 +119,30 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <span className="absolute -bottom-0.5 -right-0.5 h-3 w-3 rounded-full border-2 border-[#12161e] bg-emerald-400" />
           </div>
           <div className="min-w-0">
-            <div className="truncate text-[13px] font-bold text-slate-100">Puskodal Operator</div>
-            <div className="text-[10px] font-mono text-slate-500">Administrator</div>
+            <div className="truncate text-[13px] font-bold text-slate-100">{principalName || 'Operator'}</div>
+            <div className="text-[10px] font-mono capitalize text-slate-500">
+              {principalRole === 'admin' ? 'Administrator' : principalRole === 'viewer' ? 'User biasa · Viewer' : principalRole || 'Operator'}
+            </div>
           </div>
-          <ShieldCheck className="ml-auto h-4 w-4 text-emerald-400/80" />
+          <ShieldCheck className="ml-auto h-4 w-4 shrink-0 text-emerald-400/80" />
+        </div>
+        <div className="mx-4 mb-4 flex gap-2">
+          {principalRole === 'admin' && (
+            <button
+              type="button"
+              onClick={onCreateTestUser}
+              className="flex-1 rounded-lg border border-cyan-800/60 bg-cyan-950/25 px-2 py-2 text-[9px] font-mono font-bold text-cyan-200 hover:border-cyan-500/70 hover:bg-cyan-950/50"
+            >
+              BUAT USER UJI
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={onLogout}
+            className="flex-1 rounded-lg border border-slate-700 bg-[#151a22] px-3 py-2 text-[9px] font-mono font-bold text-slate-300 hover:border-rose-700/60 hover:text-rose-200"
+          >
+            KELUAR
+          </button>
         </div>
 
         {/* Navigation */}
@@ -120,7 +150,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           Menu Utama
         </div>
         <nav className="mt-2 flex-1 space-y-1 overflow-y-auto px-3 pb-4">
-          {MENU.map(item => {
+          {MENU.filter(item => item.id !== 5 || principalRole === 'admin').map(item => {
             const Icon = item.icon;
             const isActive = activeTab === item.id;
             return (

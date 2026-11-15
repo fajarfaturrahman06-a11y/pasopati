@@ -204,8 +204,8 @@ Bukti uji:
 - Script CLI berganti nama menjadi `pasopati_audit.py` dan `pasopati_remediate.py`;
   endpoint lama dipertahankan sebagai alias.
 - CSS Streamlit dipindahkan ke `assets/pasopati.css` agar `app.py` ringkas.
-- Identifier teknis kini memakai `X-Pasopati-API-Key`, `PASOPATI_API_KEY`, dan nama
-  rule firewall `PASOPATI-Block-<port>` agar konsisten dengan branding yang terlihat.
+- Identifier teknis (`X-Pasopati-API-Key`, `PASOPATI_API_KEY`, nama rule firewall)
+  dipertahankan untuk kompatibilitas; yang berubah adalah branding yang terlihat.
 
 ## 7. Cara menjalankan ulang
 

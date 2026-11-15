@@ -1,0 +1,694 @@
+{
+  "os": "windows",
+  "version": 1,
+  "controls": [
+    {
+      "parameter": "UAC: Admin Consent Prompt Behaviour",
+      "category": "Access Control",
+      "cis_id": "CIS 2.3.17.1",
+      "severity": "high",
+      "mitigation": "Set ConsentPromptBehaviorAdmin=2 (prompt for consent on secure desktop).",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        "name": "ConsentPromptBehaviorAdmin",
+        "expect": [
+          2
+        ]
+      }
+    },
+    {
+      "parameter": "UAC: Installer Detection",
+      "category": "Access Control",
+      "cis_id": "CIS 2.3.17.2",
+      "severity": "medium",
+      "mitigation": "EnableInstallerDetection=1.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        "name": "EnableInstallerDetection",
+        "expect": [
+          1
+        ]
+      }
+    },
+    {
+      "parameter": "UAC: Secure UI Paths",
+      "category": "Access Control",
+      "cis_id": "CIS 2.3.17.3",
+      "severity": "medium",
+      "mitigation": "EnableSecureUIAPaths=1.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        "name": "EnableSecureUIAPaths",
+        "expect": [
+          1
+        ]
+      }
+    },
+    {
+      "parameter": "UAC: Filter Administrator Token",
+      "category": "Access Control",
+      "cis_id": "CIS 2.3.17.4",
+      "severity": "high",
+      "mitigation": "FilterAdministratorToken=1 (Admin Approval Mode untuk RID-500).",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        "name": "FilterAdministratorToken",
+        "expect": [
+          1
+        ]
+      }
+    },
+    {
+      "parameter": "LSA Protection (RunAsPPL)",
+      "category": "Kernel & Boot",
+      "cis_id": "CIS 18.3.1",
+      "severity": "high",
+      "mitigation": "RunAsPPL=1 untuk melindungi LSASS dari dumping.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa",
+        "name": "RunAsPPL",
+        "expect": [
+          1
+        ]
+      }
+    },
+    {
+      "parameter": "LSA: NoLMHash",
+      "category": "Cryptographic Posture",
+      "cis_id": "CIS 2.3.11.1",
+      "severity": "medium",
+      "mitigation": "NoLMHash=1 (jangan simpan hash LM).",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa",
+        "name": "NoLMHash",
+        "expect": [
+          1
+        ]
+      }
+    },
+    {
+      "parameter": "LSA: Limit Blank Password Use",
+      "category": "Access Control",
+      "cis_id": "CIS 2.3.11.3",
+      "severity": "medium",
+      "mitigation": "LimitBlankPasswordUse=1.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa",
+        "name": "LimitBlankPasswordUse",
+        "expect": [
+          1
+        ]
+      }
+    },
+    {
+      "parameter": "LSA: Restrict Anonymous",
+      "category": "Access Control",
+      "cis_id": "CIS 2.3.10.1",
+      "severity": "medium",
+      "mitigation": "RestrictAnonymous=1.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa",
+        "name": "RestrictAnonymous",
+        "expect": [
+          1
+        ]
+      }
+    },
+    {
+      "parameter": "LSA: Restrict Anonymous SAM",
+      "category": "Access Control",
+      "cis_id": "CIS 2.3.10.2",
+      "severity": "medium",
+      "mitigation": "RestrictAnonymousSAM=1.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa",
+        "name": "RestrictAnonymousSAM",
+        "expect": [
+          1
+        ]
+      }
+    },
+    {
+      "parameter": "SMB Client: Require Signing",
+      "category": "Network & Port",
+      "cis_id": "CIS 2.3.8.1",
+      "severity": "high",
+      "mitigation": "RequireSecuritySignature=1 pada LanmanWorkstation.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanWorkstation\\Parameters",
+        "name": "RequireSecuritySignature",
+        "expect": [
+          1
+        ]
+      }
+    },
+    {
+      "parameter": "SMB Client: Disable Plaintext Password",
+      "category": "Cryptographic Posture",
+      "cis_id": "CIS 2.3.8.2",
+      "severity": "medium",
+      "mitigation": "EnablePlainTextPassword=0.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanWorkstation\\Parameters",
+        "name": "EnablePlainTextPassword",
+        "expect": [
+          0
+        ]
+      }
+    },
+    {
+      "parameter": "SMB Client: Disable Insecure Guest Auth",
+      "category": "Network & Port",
+      "cis_id": "CIS 2.3.8.3",
+      "severity": "medium",
+      "mitigation": "AllowInsecureGuestAuth=0.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SYSTEM\\CurrentControlSet\\Services\\LanmanWorkstation\\Parameters",
+        "name": "AllowInsecureGuestAuth",
+        "expect": [
+          0
+        ]
+      }
+    },
+    {
+      "parameter": "WDigest Credential Caching",
+      "category": "Cryptographic Posture",
+      "cis_id": "CIS 18.3.4",
+      "severity": "medium",
+      "mitigation": "UseLogonCredential=0.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\SecurityProviders\\WDigest",
+        "name": "UseLogonCredential",
+        "expect": [
+          0
+        ]
+      }
+    },
+    {
+      "parameter": "NTLM Outgoing: Restrict",
+      "category": "Cryptographic Posture",
+      "cis_id": "CIS 2.3.11.9",
+      "severity": "medium",
+      "mitigation": "RestrictSendingNTLMTraffic=2.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa\\MSV1_0",
+        "name": "RestrictSendingNTLMTraffic",
+        "expect": [
+          2
+        ]
+      }
+    },
+    {
+      "parameter": "PowerShell Script Block Logging",
+      "category": "System Logging",
+      "cis_id": "CIS 18.9.100.1",
+      "severity": "high",
+      "mitigation": "EnableScriptBlockLogging=1.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell\\ScriptBlockLogging",
+        "name": "EnableScriptBlockLogging",
+        "expect": [
+          1
+        ]
+      }
+    },
+    {
+      "parameter": "PowerShell Transcription",
+      "category": "System Logging",
+      "cis_id": "CIS 18.9.100.2",
+      "severity": "medium",
+      "mitigation": "Aktifkan transcription (OutputDirectory + EnableTranscripting).",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell\\Transcription",
+        "name": "EnableTranscripting",
+        "expect": [
+          1
+        ]
+      }
+    },
+    {
+      "parameter": "WinRM: Basic Authentication Disabled",
+      "category": "Access Control",
+      "cis_id": "CIS 18.9.102.1.1",
+      "severity": "medium",
+      "mitigation": "AllowBasic=0 pada WinRM Client & Service.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WinRM\\Client",
+        "name": "AllowBasic",
+        "expect": [
+          0
+        ]
+      }
+    },
+    {
+      "parameter": "WinRM: Unencrypted Traffic Disabled",
+      "category": "Cryptographic Posture",
+      "cis_id": "CIS 18.9.102.2.1",
+      "severity": "medium",
+      "mitigation": "AllowUnencrypted=0 pada WinRM Service.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WinRM\\Service",
+        "name": "AllowUnencrypted",
+        "expect": [
+          0
+        ]
+      }
+    },
+    {
+      "parameter": "SmartScreen: Explorer Enabled",
+      "category": "Endpoint Protection",
+      "cis_id": "CIS 18.9.14.2",
+      "severity": "medium",
+      "mitigation": "SmartScreenEnabled=RequireAdmin.",
+      "check": {
+        "type": "registry",
+        "path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\System",
+        "name": "EnableSmartScreen",
+        "expect": [
+          1
+        ],
+        "dword": true
+      }
+    },
+    {
+      "parameter": "SmartScreen: App & File Guard",
+      "category": "Endpoint Protection",
+      "cis_id": "CIS 18.9.14.3",
+      "severity": "medium",
+      "mitigation": "ShellSmartScreenLevel=Block untuk aplikasi.",
+      "check": {
+        "type": "registry",
+        "path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\System",
+        "name": "ShellSmartScreenLevel",
+        "expect": [
+          "Block"
+        ]
+      }
+    },
+    {
+      "parameter": "Defender: PUA Protection",
+      "category": "Endpoint Protection",
+      "cis_id": "CIS 18.9.47.3",
+      "severity": "high",
+      "mitigation": "PUAProtection=1.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender",
+        "name": "PUAProtection",
+        "expect": [
+          1
+        ]
+      }
+    },
+    {
+      "parameter": "Defender: Cloud Block Level",
+      "category": "Endpoint Protection",
+      "cis_id": "CIS 18.9.47.5",
+      "severity": "medium",
+      "mitigation": "CloudBlockLevel=2 (high).",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\MpEngine",
+        "name": "CloudBlockLevel",
+        "expect": [
+          2
+        ]
+      }
+    },
+    {
+      "parameter": "Defender: Sample Submission",
+      "category": "Endpoint Protection",
+      "cis_id": "CIS 18.9.47.8",
+      "severity": "low",
+      "mitigation": "SubmitSamplesConsent=1 (send safe samples).",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Spynet",
+        "name": "SubmitSamplesConsent",
+        "expect": [
+          1
+        ]
+      }
+    },
+    {
+      "parameter": "Defender: Behaviour Monitoring",
+      "category": "Endpoint Protection",
+      "cis_id": "CIS 18.9.47.9",
+      "severity": "medium",
+      "mitigation": "DisableBehaviorMonitoring=0.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Real-Time Protection",
+        "name": "DisableBehaviorMonitoring",
+        "expect": [
+          0
+        ]
+      }
+    },
+    {
+      "parameter": "Telemetry: AllowTelemetry",
+      "category": "System Logging",
+      "cis_id": "CIS 18.9.104.1",
+      "severity": "low",
+      "mitigation": "AllowTelemetry 0/1 (minimal).",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\DataCollection",
+        "name": "AllowTelemetry",
+        "expect": [
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "parameter": "Consumer Features Disabled",
+      "category": "Endpoint Protection",
+      "cis_id": "CIS 18.9.104.2",
+      "severity": "low",
+      "mitigation": "DisableWindowsConsumerFeatures=1.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\CloudContent",
+        "name": "DisableWindowsConsumerFeatures",
+        "expect": [
+          1
+        ]
+      }
+    },
+    {
+      "parameter": "Cortana Disabled",
+      "category": "Endpoint Protection",
+      "cis_id": "CIS 18.9.104.3",
+      "severity": "low",
+      "mitigation": "AllowCortana=0.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Windows Search",
+        "name": "AllowCortana",
+        "expect": [
+          0
+        ]
+      }
+    },
+    {
+      "parameter": "Windows Update: Exclude Drivers",
+      "category": "Endpoint Protection",
+      "cis_id": "CIS 18.9.102.3",
+      "severity": "low",
+      "mitigation": "ExcludeWUDriversInQualityUpdate=1.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate",
+        "name": "ExcludeWUDriversInQualityUpdate",
+        "expect": [
+          1
+        ]
+      }
+    },
+    {
+      "parameter": "Windows Update: Not Disabled",
+      "category": "Endpoint Protection",
+      "cis_id": "CIS 18.9.102.4",
+      "severity": "medium",
+      "mitigation": "NoAutoUpdate=0.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU",
+        "name": "NoAutoUpdate",
+        "expect": [
+          0
+        ]
+      }
+    },
+    {
+      "parameter": "BitLocker: XTS-AES 256",
+      "category": "Cryptographic Posture",
+      "cis_id": "CIS 18.10.9",
+      "severity": "high",
+      "na_if": "missing:C:\\Windows\\System32\\manage-bde.exe",
+      "mitigation": "EncryptionMethodWithXtsOs=7.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\FVE",
+        "name": "EncryptionMethodWithXtsOs",
+        "expect": [
+          7
+        ]
+      }
+    },
+    {
+      "parameter": "RDP: Security Layer TLS",
+      "category": "Access Control",
+      "cis_id": "CIS 18.9.65.3.1",
+      "severity": "high",
+      "na_if": "missing:C:\\Windows\\System32\\mstsc.exe",
+      "mitigation": "SecurityLayer=2 (TLS).",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\Terminal Services",
+        "name": "SecurityLayer",
+        "expect": [
+          2
+        ]
+      }
+    },
+    {
+      "parameter": "RDP: Minimum Encryption Level",
+      "category": "Cryptographic Posture",
+      "cis_id": "CIS 18.9.65.3.2",
+      "severity": "medium",
+      "na_if": "missing:C:\\Windows\\System32\\mstsc.exe",
+      "mitigation": "MinEncryptionLevel=3 (high).",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\Terminal Services",
+        "name": "MinEncryptionLevel",
+        "expect": [
+          3
+        ]
+      }
+    },
+    {
+      "parameter": "RDP: Enabled",
+      "category": "Access Control",
+      "cis_id": "CIS 18.9.65.1",
+      "severity": "low",
+      "na_if": "missing:C:\\Windows\\System32\\mstsc.exe",
+      "mitigation": "fDenyTSConnections=0.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Terminal Server",
+        "name": "fDenyTSConnections",
+        "expect": [
+          0
+        ]
+      }
+    },
+    {
+      "parameter": "Autorun Disabled",
+      "category": "Endpoint Protection",
+      "cis_id": "CIS 18.9.14.4",
+      "severity": "medium",
+      "mitigation": "NoAutorun=1.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Explorer",
+        "name": "NoAutorun",
+        "expect": [
+          1
+        ]
+      }
+    },
+    {
+      "parameter": "MSI AlwaysInstallElevated",
+      "category": "Access Control",
+      "cis_id": "CIS 18.9.85.1",
+      "severity": "medium",
+      "mitigation": "AlwaysInstallElevated=0 di mesin & pengguna.",
+      "check": {
+        "type": "registry",
+        "dword": true,
+        "path": "HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer",
+        "name": "AlwaysInstallElevated",
+        "expect": [
+          0
+        ]
+      }
+    },
+    {
+      "parameter": "Password Policy: History",
+      "category": "Access Control",
+      "cis_id": "CIS 1.1.1",
+      "severity": "medium",
+      "mitigation": "Riwayat sandi minimal 24.",
+      "check": {
+        "type": "command",
+        "argv": [
+          "powershell",
+          "-NoProfile",
+          "-Command",
+          "$t = (net accounts | Out-String); if ($t -match '(?im)^(?:Password history|Riwayat sandi)[^\\n]*(\\d+)') { [int]$Matches[1] }"
+        ],
+        "min": 24,
+        "timeout": 10
+      }
+    },
+    {
+      "parameter": "Password Policy: Maximum Age",
+      "category": "Access Control",
+      "cis_id": "CIS 1.1.3",
+      "severity": "low",
+      "mitigation": "Maksimal usia sandi <= 365 hari.",
+      "check": {
+        "type": "command",
+        "argv": [
+          "powershell",
+          "-NoProfile",
+          "-Command",
+          "$t = (net accounts | Out-String); if ($t -match '(?im)^(?:Maximum password age|Usia sandi maksimum)[^\\n]*(\\d+)') { [int]$Matches[1] }"
+        ],
+        "min": 1,
+        "max": 365,
+        "timeout": 10
+      }
+    },
+    {
+      "parameter": "Password Policy: Complexity",
+      "category": "Access Control",
+      "cis_id": "CIS 1.1.5",
+      "severity": "medium",
+      "mitigation": "Aktifkan kompleksitas sandi.",
+      "check": {
+        "type": "command",
+        "argv": [
+          "net",
+          "accounts"
+        ],
+        "output": "(complexity|kompleksitas)[^\\n]*(enabled|yes|ya|aktif)",
+        "timeout": 8
+      }
+    },
+    {
+      "parameter": "NetBIOS over TCP/IP Disabled",
+      "category": "Network & Port",
+      "cis_id": "CIS 18.9.65.4",
+      "severity": "medium",
+      "mitigation": "Set NetbiosOptions=2 di semua antarmuka.",
+      "check": {
+        "type": "command",
+        "argv": [
+          "powershell",
+          "-NoProfile",
+          "-Command",
+          "(Get-ChildItem 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\NetBT\\Parameters\\Interfaces' | ForEach-Object { (Get-ItemProperty $_.PSPath).NetbiosOptions }) -join ','"
+        ],
+        "output": "^2(,2)*$",
+        "timeout": 12
+      }
+    },
+    {
+      "parameter": "SMB Server: Encrypt Data",
+      "category": "Cryptographic Posture",
+      "cis_id": "CIS 2.3.9.1",
+      "severity": "medium",
+      "mitigation": "Enable SMB encryption (EncryptData=True).",
+      "check": {
+        "type": "command",
+        "argv": [
+          "powershell",
+          "-NoProfile",
+          "-Command",
+          "(Get-SmbServerConfiguration).EncryptData"
+        ],
+        "output": "True",
+        "timeout": 12
+      }
+    },
+    {
+      "parameter": "Sysmon Installed & Running",
+      "category": "System Logging",
+      "cis_id": "DISA STIG WN11-AU-000051",
+      "severity": "low",
+      "mitigation": "Pasang Sysmon dan jalankan sebagai service.",
+      "check": {
+        "type": "command",
+        "argv": [
+          "powershell",
+          "-NoProfile",
+          "-Command",
+          "if (Get-Service sysmon64,sysmon -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }"
+        ],
+        "timeout": 10
+      }
+    },
+    {
+      "parameter": "Time Service Not Disabled",
+      "category": "System Logging",
+      "cis_id": "CIS 2.2.1",
+      "severity": "low",
+      "mitigation": "Jangan menonaktifkan w32time.",
+      "check": {
+        "type": "command",
+        "argv": [
+          "sc",
+          "qc",
+          "w32time"
+        ],
+        "output": "DISABLED",
+        "mode": "nomatch",
+        "timeout": 8
+      }
+    }
+  ]
+}

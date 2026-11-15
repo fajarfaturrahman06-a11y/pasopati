@@ -80,12 +80,21 @@ async function newPlan(port) {
     items: [{ alias: 'fw-enable-ufw', risk: 'LOW' }]
   });
   const approved = await req(port, 'POST', '/api/remediation-approve', {
-    planId: created.json?.plan?.planId
+    planId: created.json?.plan?.planId,
+    acknowledgeConsole: true,
+    selfApprove: true
   });
   return { planId: created.json?.plan?.planId, nonce: approved.json?.nonce };
 }
 
 const evidence = [{ stepIndex: 0, alias: 'fw-enable-ufw', exitCode: 0, outputHash: 'sha256:x', verified: true }];
+const postAudit = {
+  scoring: { cyber_readiness_score: 100, failed_checks: 0 },
+  compliance_matrix: [
+    { parameter: 'Host-Based Local Firewall Active', status: 'PASS' },
+    { parameter: 'Network & Dangerous Ports Filtering', status: 'PASS' }
+  ]
+};
 
 try {
   // ---- A. token pendek: approve ulang setelah kedaluwarsa harus boleh ----
@@ -94,13 +103,13 @@ try {
     const { server, dataDir } = await boot(port, { REMEDIATION_TOKEN_TTL_MS: '200', REMEDIATION_EVIDENCE_GRACE_MS: '5000' });
     const { planId, nonce } = await newPlan(port);
     await sleep(350);
-    const re = await req(port, 'POST', '/api/remediation-approve', { planId });
+    const re = await req(port, 'POST', '/api/remediation-approve', { planId, acknowledgeConsole: true, selfApprove: true });
     check('Approve ulang setelah token kedaluwarsa diterima', re.status === 200 && typeof re.json?.nonce === 'string', `status=${re.status}`);
     const newNonce = re.json?.nonce;
     check('Nonce baru berbeda dari nonce lama', Boolean(newNonce) && newNonce !== nonce);
-    const staleNonce = await req(port, 'POST', '/api/remediation-verify', { planId, nonce, toStatus: 'VERIFIED', evidence });
+    const staleNonce = await req(port, 'POST', '/api/remediation-verify', { planId, nonce, toStatus: 'VERIFIED', evidence, postAudit });
     check('Nonce lama ditolak setelah re-approve', staleNonce.status === 401, `status=${staleNonce.status}`);
-    const freshNonce = await req(port, 'POST', '/api/remediation-verify', { planId, nonce: newNonce, toStatus: 'VERIFIED', evidence });
+    const freshNonce = await req(port, 'POST', '/api/remediation-verify', { planId, nonce: newNonce, toStatus: 'VERIFIED', evidence, postAudit });
     check('Nonce baru diterima', freshNonce.status === 200, `status=${freshNonce.status}`);
     server.kill('SIGKILL');
     fs.rmSync(dataDir, { recursive: true, force: true });

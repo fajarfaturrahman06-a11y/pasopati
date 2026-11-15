@@ -4,6 +4,7 @@ import type { Request, Response, NextFunction } from 'express';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import https from 'https';
 import { execFile } from 'child_process';
 import { ZipArchive, type ArchiverError } from 'archiver';
 import dotenv from 'dotenv';
@@ -11,6 +12,11 @@ import { GoogleGenAI } from '@google/genai';
 import crypto from 'crypto';
 import { normalizeAuditAction } from './src/auditActions';
 import { redactSensitive } from './src/redaction';
+import { findEndpointByIdentity, normalizeEndpointInput, readEndpointRecords, writeEndpointRecords } from './src/endpointStore';
+import type { EndpointRecord } from './src/endpointStore';
+import { appendEndpointHealthAuditRecord, readEndpointHealthAuditRecords } from './src/endpointHealthAuditStore';
+import type { EndpointHealthAuditEventType, EndpointHealthAuditRecord } from './src/endpointHealthAuditStore';
+import { isValidPassword, isValidUsername, SESSION_TTL_SECONDS, UserSessionStore } from './src/userSessions';
 
 dotenv.config();
 
@@ -44,6 +50,12 @@ if (TRUST_PROXY) app.set('trust proxy', /^\d+$/.test(TRUST_PROXY) ? Number(TRUST
 // Folder penyimpanan state (quarantine/plan/nonce/audit). Bisa diarahkan ke folder
 // sementara saat pengujian agar data operasional tidak tercampur.
 const DATA_DIR = process.env.PASOPATI_DATA_DIR ? path.resolve(process.env.PASOPATI_DATA_DIR) : path.resolve(process.cwd(), 'data');
+const SESSION_COOKIE = 'pasopati_session';
+const userSessionStore = new UserSessionStore(
+  path.join(DATA_DIR, 'auth.sqlite'),
+  process.env.PASOPATI_ADMIN_USERNAME || '',
+  process.env.PASOPATI_ADMIN_PASSWORD || ''
+);
 
 /** Tulis JSON secara atomik (tmp + rename) agar file state tidak pernah setengah jadi. */
 function writeJsonAtomic(filePath: string, value: unknown) {
@@ -87,16 +99,110 @@ function safeEqualStrTop(a: string, b: string): boolean {
 // API key gate for operational endpoints (fail-closed, tanpa bypass loopback)
 const API_KEY = (process.env.PASOPATI_API_KEY || '').trim();
 
-const requireApiKey = (req: Request, res: Response, next: NextFunction) => {
-  if (!API_KEY) {
-    return res.status(503).json({ status: 'rejected', reason: 'Server belum siap: set PASOPATI_API_KEY di environment.' });
+// ===== Identitas & RBAC =====
+// Master PASOPATI_API_KEY = admin (bootstrap/kompatibilitas). Selain itu ada
+// operator ber-role dan host ter-enrol dengan kunci sendiri. Yang disimpan hanya
+// hash SHA-256 kuncinya; kunci mentah ditampilkan sekali saat dibuat.
+type Role = 'viewer' | 'planner' | 'approver' | 'executor' | 'admin' | 'agent';
+interface Principal { name: string; role: Role; kind: 'master' | 'operator' | 'host' | 'session'; hostId?: string }
+interface OperatorRecord { name: string; role: Role; keyHash: string; createdAt: string; revokedAt?: string; lastSeenAt?: string }
+interface HostRecord { hostId: string; name: string; keyHash: string; createdAt: string; revokedAt?: string; lastSeenAt?: string }
+
+const OPERATORS_PATH = path.join(DATA_DIR, 'operators.json');
+const HOSTS_PATH = path.join(DATA_DIR, 'hosts.json');
+const OPERATOR_ROLES: Role[] = ['viewer', 'planner', 'approver', 'executor'];
+
+function sha256(value: string): string {
+  return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+function readJsonArray<T>(filePath: string): T[] {
+  try {
+    if (!fs.existsSync(filePath)) return [];
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
   }
-  const provided = req.headers['x-pasopati-api-key'] as string | undefined;
-  if (provided && safeEqualStrTop(provided.trim(), API_KEY)) {
+}
+
+const operatorsStore: OperatorRecord[] = readJsonArray<OperatorRecord>(OPERATORS_PATH);
+const hostsStore: HostRecord[] = readJsonArray<HostRecord>(HOSTS_PATH);
+
+function saveOperators() {
+  try { writeJsonAtomic(OPERATORS_PATH, operatorsStore); } catch (err) {
+    console.error('[PASOPATI] Gagal menulis operators:', (err as Error).message);
+  }
+}
+function saveHosts() {
+  try { writeJsonAtomic(HOSTS_PATH, hostsStore); } catch (err) {
+    console.error('[PASOPATI] Gagal menulis hosts:', (err as Error).message);
+  }
+}
+
+const HOST_KEY_HEADER = 'x-pasopati-host-key';
+
+function resolvePrincipal(req: Request): Principal | null {
+  const hostKey = String(req.headers[HOST_KEY_HEADER] || '').trim();
+  if (hostKey) {
+    const hash = sha256(hostKey);
+    const host = hostsStore.find(h => h.keyHash === hash && !h.revokedAt);
+    if (!host) return null;
+    host.lastSeenAt = new Date().toISOString();
+    return { name: host.name, role: 'agent', kind: 'host', hostId: host.hostId };
+  }
+  const provided = String(req.headers['x-pasopati-api-key'] || '').trim();
+  if (provided) {
+    if (API_KEY && safeEqualStrTop(provided, API_KEY)) {
+      return { name: 'master', role: 'admin', kind: 'master' };
+    }
+    const hash = sha256(provided);
+    const operator = operatorsStore.find(o => o.keyHash === hash && !o.revokedAt);
+    if (operator) {
+      operator.lastSeenAt = new Date().toISOString();
+      return { name: operator.name, role: operator.role, kind: 'operator' };
+    }
+    return null;
+  }
+  const cookies = String(req.headers.cookie || '').split(';');
+  const sessionCookie = cookies.map(part => part.trim()).find(part => part.startsWith(`${SESSION_COOKIE}=`));
+  const token = sessionCookie ? sessionCookie.slice(SESSION_COOKIE.length + 1) : '';
+  const session = token ? userSessionStore.getSession(token) : null;
+  return session ? { name: session.username, role: session.role, kind: 'session' } : null;
+}
+
+function hasSameOrigin(req: Request): boolean {
+  const origin = req.get('origin');
+  if (!origin) return false;
+  try {
+    return new URL(origin).origin === `${req.protocol}://${req.get('host')}`;
+  } catch {
+    return false;
+  }
+}
+
+function requireRole(...roles: Role[]) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (!API_KEY && operatorsStore.length === 0 && hostsStore.length === 0 && userSessionStore.userCount === 0) {
+      return res.status(503).json({ status: 'rejected', reason: 'Server belum siap: set PASOPATI_API_KEY di environment.' });
+    }
+    const principal = resolvePrincipal(req);
+    if (!principal) {
+      return res.status(401).json({ status: 'rejected', reason: 'Kredensial tidak valid atau sudah dicabut.' });
+    }
+    if (principal.role !== 'admin' && !roles.includes(principal.role)) {
+      return res.status(403).json({ status: 'rejected', reason: `Role ${principal.role} tidak berhak untuk endpoint ini.` });
+    }
+    if (principal.kind === 'session' && ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) && !hasSameOrigin(req)) {
+      return res.status(403).json({ status: 'rejected', reason: 'Origin request tidak valid.' });
+    }
+    (req as Request & { principal?: Principal }).principal = principal;
     return next();
-  }
-  return res.status(401).json({ status: 'rejected', reason: 'X-Pasopati-API-Key tidak valid.' });
-};
+  };
+}
+
+/** Hanya "sudah terautentikasi" (semua role). */
+const requireApiKey = requireRole('viewer', 'planner', 'approver', 'executor', 'agent');
 
 // Helper to get fallback tactical risk analysis
 function getFallbackRiskAnalysis(deviceName: string, deviceRole: string, os: string, failChecks: any[]) {
@@ -138,7 +244,7 @@ function getFallbackRiskAnalysis(deviceName: string, deviceRole: string, os: str
 }
 
 // API: AI Contextual Threat Analysis (wajib X-Pasopati-API-Key; body userApiKey = GEMINI key terpisah)
-app.post('/api/analyze-threats', requireApiKey, rateLimit(20), asyncHandler(async (req, res) => {
+app.post('/api/analyze-threats', requireApiKey, rateLimit(20, 'analyze'), asyncHandler(async (req, res) => {
   const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, any>;
   const deviceName = String(body.deviceName ?? 'UNKNOWN-NODE').slice(0, 120);
   const deviceRole = String(body.deviceRole ?? 'UNASSIGNED').slice(0, 160);
@@ -165,11 +271,13 @@ app.post('/api/analyze-threats', requireApiKey, rateLimit(20), asyncHandler(asyn
   const apiKey = rawKey.trim();
 
   // If no valid key provided or placeholder, use fast military rule-based engine directly
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey.length < 15 || apiKey.startsWith('MY_')) {
+  const aiDisabled = (process.env.AI_DISABLED || '').trim() === '1';
+  if (aiDisabled || !apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey.length < 15 || apiKey.startsWith('MY_')) {
     return res.json({
       source: 'rule-based-fallback',
       analysis: getFallbackRiskAnalysis(deviceName, deviceRole, os, failChecks),
-      opsec_sanitized: isOpsec
+      opsec_sanitized: isOpsec,
+      ...(aiDisabled ? { note: 'Mode air-gapped: AI cloud dimatikan (AI_DISABLED=1).' } : {})
     });
   }
 
@@ -341,21 +449,24 @@ function saveQuarantine(map: Map<string, QuarantineEntry>) {
 const quarantineRegistry = loadQuarantine();
 
 // Rate-limit sederhana in-memory (tanpa dep baru): 60 req/mnt/IP untuk endpoint sensitif.
+// Bucket dipisah per nama endpoint — sebelumnya satu Map global membuat limit ingest
+// dan evidence saling memakan kuota klien yang sama.
 const rateBuckets = new Map<string, { count: number; resetAt: number }>();
 const RATE_BUCKET_SOFT_LIMIT = 5000;
-function rateLimit(maxPerMinute: number) {
+function rateLimit(maxPerMinute: number, name = 'default') {
   return (req: Request, res: Response, next: NextFunction) => {
     const ip = String((req.socket?.remoteAddress as string) || req.ip || 'unknown');
+    const key = `${name}:${ip}`;
     const now = Date.now();
     // Bersihkan bucket kedaluwarsa agar Map tidak tumbuh tanpa batas.
     if (rateBuckets.size > RATE_BUCKET_SOFT_LIMIT) {
-      for (const [key, value] of rateBuckets) {
-        if (now > value.resetAt) rateBuckets.delete(key);
+      for (const [bucketKey, value] of rateBuckets) {
+        if (now > value.resetAt) rateBuckets.delete(bucketKey);
       }
     }
-    const bucket = rateBuckets.get(ip);
+    const bucket = rateBuckets.get(key);
     if (!bucket || now > bucket.resetAt) {
-      rateBuckets.set(ip, { count: 1, resetAt: now + 60_000 });
+      rateBuckets.set(key, { count: 1, resetAt: now + 60_000 });
       return next();
     }
     if (bucket.count >= maxPerMinute) {
@@ -366,7 +477,402 @@ function rateLimit(maxPerMinute: number) {
   };
 }
 
-app.post('/api/ingest', rateLimit(60), (req, res) => {
+// Registry endpoint JSON persisten. Operasi baca-ubah-tulis pada route di bawah
+// sengaja sinkron: Node hanya menjalankan satu handler JavaScript pada satu waktu.
+function setSessionCookie(req: Request, res: Response, token: string, maxAgeSeconds: number) {
+  const secure = req.secure || process.env.NODE_ENV === 'production';
+  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${secure ? '; Secure' : ''}`);
+}
+
+function clearSessionCookie(req: Request, res: Response) {
+  const secure = req.secure || process.env.NODE_ENV === 'production';
+  res.setHeader('Set-Cookie', `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure ? '; Secure' : ''}`);
+}
+
+app.post('/api/auth/login', rateLimit(10, 'auth-login'), (req, res) => {
+  if (!hasSameOrigin(req)) return res.status(403).json({ status: 'rejected', reason: 'Origin request tidak valid.' });
+  if (!userSessionStore.userCount) {
+    return res.status(503).json({ status: 'rejected', reason: 'Belum ada akun. Konfigurasikan PASOPATI_ADMIN_USERNAME dan PASOPATI_ADMIN_PASSWORD di environment lokal lalu jalankan ulang server.' });
+  }
+  const username = typeof req.body?.username === 'string' ? req.body.username : '';
+  const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  const identity = userSessionStore.authenticate(username, password);
+  if (!identity) return res.status(401).json({ status: 'rejected', reason: 'Username atau password tidak valid.' });
+  const session = userSessionStore.createSession(identity.username);
+  setSessionCookie(req, res, session.token, SESSION_TTL_SECONDS);
+  return res.json({ authenticated: true, name: identity.username, role: identity.role, kind: 'session', expiresAt: session.expiresAt });
+});
+
+app.get('/api/auth/session', (req, res) => {
+  const cookies = String(req.headers.cookie || '').split(';');
+  const part = cookies.map(value => value.trim()).find(value => value.startsWith(`${SESSION_COOKIE}=`));
+  const token = part ? part.slice(SESSION_COOKIE.length + 1) : '';
+  const identity = token ? userSessionStore.getSession(token) : null;
+  if (!identity) {
+    if (token) clearSessionCookie(req, res);
+    return res.json({ authenticated: false });
+  }
+  return res.json({ authenticated: true, name: identity.username, role: identity.role, kind: 'session' });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  if (!hasSameOrigin(req)) return res.status(403).json({ status: 'rejected', reason: 'Origin request tidak valid.' });
+  const cookies = String(req.headers.cookie || '').split(';');
+  const part = cookies.map(value => value.trim()).find(value => value.startsWith(`${SESSION_COOKIE}=`));
+  const token = part ? part.slice(SESSION_COOKIE.length + 1) : '';
+  if (token) userSessionStore.deleteSession(token);
+  clearSessionCookie(req, res);
+  return res.status(204).end();
+});
+
+app.post('/api/auth/users', requireRole('admin'), rateLimit(20, 'auth-user-create'), (req, res) => {
+  const principal = (req as Request & { principal?: Principal }).principal;
+  if (principal?.kind !== 'session' || principal.role !== 'admin') {
+    return res.status(403).json({ status: 'rejected', reason: 'Buat akun username/password hanya dapat dilakukan dari sesi admin.' });
+  }
+  const username = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
+  const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  if (!isValidUsername(username)) return res.status(400).json({ status: 'rejected', reason: 'Username harus 3–40 karakter: huruf, angka, titik, garis bawah, atau tanda hubung.' });
+  if (!isValidPassword(password)) return res.status(400).json({ status: 'rejected', reason: 'Password harus 12–256 karakter.' });
+  try {
+    userSessionStore.createViewer(username, password);
+    return res.status(201).json({ username, role: 'viewer' });
+  } catch (err) {
+    const message = (err as Error).message;
+    if (/UNIQUE constraint failed/i.test(message)) return res.status(409).json({ status: 'rejected', reason: 'Username sudah digunakan.' });
+    return res.status(400).json({ status: 'rejected', reason: message });
+  }
+});
+
+const ENDPOINTS_PATH = path.join(DATA_DIR, 'endpoint_inventory.json');
+const ENDPOINT_HEALTH_AUDIT_DB_PATH = path.join(DATA_DIR, 'endpoint_health_audit.sqlite');
+const MAX_ENDPOINT_BODY_BYTES = 1024 * 1024;
+
+function endpointRecords(): EndpointRecord[] {
+  return readEndpointRecords(ENDPOINTS_PATH);
+}
+
+function endpointBodyTooLarge(req: Request, res: Response): boolean {
+  const raw = (req as Request & { rawBody?: Buffer }).rawBody;
+  if (raw && raw.length > MAX_ENDPOINT_BODY_BYTES) {
+    res.status(413).json({ status: 'rejected', reason: 'Payload endpoint melebihi batas 1 MB.' });
+    return true;
+  }
+  return false;
+}
+
+function endpointActor(req: Request): string {
+  return (req as Request & { principal?: Principal }).principal?.name || 'operator';
+}
+
+function buildEndpointHealthAuditRecord(input: {
+  eventType: EndpointHealthAuditEventType;
+  endpointId: string;
+  accessedBy: string;
+  accessIp?: string;
+  approvedBy?: string;
+  approvedAt?: string;
+  planId?: string;
+}): EndpointHealthAuditRecord {
+  const endpoint = endpointRecords().find(item =>
+    item.id === input.endpointId || item.agentId === input.endpointId || item.hostname === input.endpointId
+  );
+  const capturedAt = new Date().toISOString();
+  const checks = endpoint?.checks || [];
+  const latest = endpoint?.history?.at(-1);
+  const countStatus = (status: string) => checks.filter(check => check.status === status).length;
+  const count = (historical: unknown, status: string) => Number.isFinite(Number(historical))
+    ? Number(historical)
+    : countStatus(status);
+  return {
+    id: crypto.randomUUID(),
+    eventType: input.eventType,
+    occurredAt: capturedAt,
+    accessedBy: input.accessedBy,
+    ...(input.accessIp ? { accessIp: input.accessIp.slice(0, 128) } : {}),
+    ...(input.approvedBy ? { approvedBy: input.approvedBy } : {}),
+    ...(input.approvedAt ? { approvedAt: input.approvedAt } : {}),
+    ...(input.planId ? { planId: input.planId.slice(0, 100) } : {}),
+    target: {
+      endpointId: endpoint?.id || input.endpointId.slice(0, 120),
+      name: endpoint?.name || 'Unknown endpoint',
+      hostname: endpoint?.hostname || '',
+      role: endpoint?.role || '',
+      os: endpoint?.os || '',
+      endpointUser: endpoint?.user || '',
+      ip: endpoint?.ip || '',
+      mac: endpoint?.mac || '',
+      ...(endpoint?.deletedAt ? { deletedAt: endpoint.deletedAt } : {})
+    },
+    computerCondition: {
+      capturedAt,
+      captureStatus: endpoint ? 'CAPTURED' : 'NOT_FOUND',
+      latestAuditAt: latest?.timestamp || null,
+      score: latest && Number.isFinite(Number(latest.score)) ? Number(latest.score) : null,
+      passCount: count(latest?.passCount, 'PASS'),
+      warningCount: count(latest?.warnCount, 'WARNING'),
+      failCount: count(latest?.failCount, 'FAIL'),
+      totalChecks: checks.length || count(latest?.passCount, 'PASS') + count(latest?.warnCount, 'WARNING') + count(latest?.failCount, 'FAIL'),
+      quarantined: endpoint?.isQuarantined === true,
+      openPorts: (endpoint?.openPorts || []).slice(0, 512),
+      failedControls: checks.filter(check => check.status === 'FAIL').slice(0, 30).map(check => String(check.parameter).slice(0, 200)),
+      warningControls: checks.filter(check => check.status === 'WARNING').slice(0, 30).map(check => String(check.parameter).slice(0, 200))
+    }
+  };
+}
+
+function addEndpointChange(record: EndpointRecord, action: EndpointRecord['changeHistory'][number]['action'], actor: string, source: 'operator' | 'agent', summary: string) {
+  record.changeHistory = [...(record.changeHistory || []), { at: new Date().toISOString(), action, actor, source, summary }].slice(-100);
+}
+
+function saveEndpointAudit(record: EndpointRecord, action: string, actor: string, summary: string) {
+  appendAuditLogs([{
+    id: `ENDPOINT-${record.id}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+    timestamp: new Date().toISOString().replace('T', ' ').substring(0, 19),
+    deviceId: record.id,
+    deviceName: record.name,
+    deviceRole: record.role,
+    action: 'BASELINE RECON',
+    operator: actor,
+    preScore: 0,
+    postScore: Number(record.history?.at(-1)?.score) || 0,
+    changesSummary: `${action}: ${summary}`.slice(0, 300),
+    changesDetails: [`Endpoint ID: ${record.id}`, `Hostname: ${record.hostname}`],
+    status: 'SUCCESS',
+    storedInDb: true
+  }]);
+}
+
+function containsControlCharacter(value: string): boolean {
+  return Array.from(value).some(char => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127);
+}
+
+function normalizeAgentTelemetry(payload: unknown, headerUnit: string | undefined) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('Body telemetri harus berupa object JSON.');
+  const body = payload as Record<string, any>;
+  const metadata = body.metadata;
+  const scoring = body.scoring;
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) throw new Error('metadata wajib berupa object.');
+  if (!scoring || typeof scoring !== 'object' || Array.isArray(scoring)) throw new Error('scoring wajib berupa object.');
+  const rawUnit = metadata.tactical_unit ?? headerUnit;
+  if (typeof rawUnit !== 'string' || !rawUnit.trim() || rawUnit.length > 64 || containsControlCharacter(rawUnit)) {
+    throw new Error('metadata.tactical_unit wajib berupa teks 1–64 karakter yang valid.');
+  }
+  if (headerUnit && metadata.tactical_unit && headerUnit.trim() !== String(metadata.tactical_unit).trim()) {
+    throw new Error('X-Pasopati-Unit tidak cocok dengan metadata.tactical_unit.');
+  }
+  const unit = rawUnit.trim();
+  const device = body.device_info === undefined ? {} : body.device_info;
+  if (!device || typeof device !== 'object' || Array.isArray(device)) throw new Error('device_info harus berupa object.');
+  const score = Number(scoring.cyber_readiness_score ?? 0);
+  if (!Number.isFinite(score) || score < 0 || score > 100) throw new Error('scoring.cyber_readiness_score harus 0–100.');
+  const count = (field: string) => {
+    const value = Number(scoring[field] ?? 0);
+    if (!Number.isInteger(value) || value < 0 || value > 100000) throw new Error(`scoring.${field} harus integer non-negatif.`);
+    return value;
+  };
+  const passed = count('passed_checks');
+  const warned = count('warning_checks');
+  const failed = count('failed_checks');
+  const total = count('total_checks');
+  if (total && passed + warned + failed > total) throw new Error('Jumlah PASS/WARNING/FAIL melebihi total_checks.');
+  if (body.compliance_matrix !== undefined && !Array.isArray(body.compliance_matrix)) throw new Error('compliance_matrix harus berupa array.');
+  const matrix = Array.isArray(body.compliance_matrix) ? body.compliance_matrix : [];
+  if (matrix.length > 500) throw new Error('compliance_matrix maksimal berisi 500 kontrol.');
+  const checks = matrix.map((item: any, index: number) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error(`compliance_matrix[${index}] harus berupa object.`);
+    const rawStatus = String(item.status || '').toUpperCase();
+    const status = rawStatus === 'SKIPPED' ? 'N/A' : rawStatus;
+    if (!['PASS', 'WARNING', 'FAIL', 'N/A', 'WAIVED'].includes(status)) throw new Error(`compliance_matrix[${index}].status tidak valid.`);
+    return {
+      id: `agent-${index + 1}`,
+      parameter: String(item.parameter || item.param || '').trim().slice(0, 200),
+      category: String(item.category || item.cat || 'Network & Port').slice(0, 80),
+      cis_id: String(item.cis_id || item.cis || '').slice(0, 120),
+      status,
+      details: String(item.details || item.detail || '').slice(0, 2000),
+      mitigation: String(item.mitigation || '').slice(0, 2000)
+    };
+  });
+  const rawPorts = device.ports_list ?? [];
+  if (!Array.isArray(rawPorts) || rawPorts.length > 512) throw new Error('device_info.ports_list harus array dengan maksimal 512 port.');
+  const platformText = `${String(device.platform_type || '')} ${String(device.os || '')}`.toLowerCase();
+  const platformType = platformText.includes('windows') ? 'windows' : (platformText.includes('embedded') || platformText.includes('openwrt') ? 'embedded' : 'linux');
+  const receivedAt = new Date();
+  const endpoint = normalizeEndpointInput({
+    agentId: unit,
+    name: unit,
+    hostname: typeof device.hostname === 'string' && device.hostname.trim() ? device.hostname.trim() : unit,
+    role: typeof metadata.device_role === 'string' ? metadata.device_role : `Endpoint (${String(device.platform_type || 'telemetri agen')})`,
+    os: typeof device.os === 'string' && device.os.trim() ? device.os : 'Unknown',
+    platformType,
+    ip: typeof device.primary_ip === 'string' && device.primary_ip !== 'unknown' ? device.primary_ip : '',
+    mac: typeof device.mac_address === 'string' ? device.mac_address : '',
+    user: typeof device.active_user === 'string' ? device.active_user : '',
+    openPorts: rawPorts.map(Number),
+    checks,
+    history: [{
+      timestamp: receivedAt.toISOString(), score, passCount: passed, warnCount: warned,
+      failCount: failed, event: 'Telemetry Ingest Puskodal'
+    }]
+  });
+  return { unit, score, passed, warned, failed, total, endpoint, receivedAt };
+}
+
+function upsertAgentEndpoint(payload: unknown, headerUnit: string | undefined, eventId: string) {
+  const incoming = normalizeAgentTelemetry(payload, headerUnit);
+  const explicitRole = Boolean((payload as any)?.metadata?.device_role);
+  const records = endpointRecords();
+  const existing = findEndpointByIdentity(records, incoming.endpoint);
+  const duplicate = Boolean(existing?.telemetryEventIds?.includes(eventId));
+  if (duplicate && existing) return { ...incoming, record: existing, created: false, duplicate: true };
+  const previousHistory = existing?.history || [];
+  const record: EndpointRecord = {
+    ...(existing || {} as EndpointRecord),
+    ...incoming.endpoint,
+    id: existing?.id || crypto.randomUUID(),
+    name: existing?.name || incoming.endpoint.name || incoming.endpoint.hostname || 'Endpoint',
+    role: (existing && !explicitRole ? existing.role : incoming.endpoint.role) || 'Endpoint',
+    source: existing?.source || 'agent',
+    createdAt: existing?.createdAt || incoming.receivedAt.toISOString(),
+    updatedAt: incoming.receivedAt.toISOString(),
+    created_at: existing?.created_at || existing?.createdAt || incoming.receivedAt.toISOString(),
+    updated_at: incoming.receivedAt.toISOString(),
+    revision: (existing?.revision || 0) + 1,
+    lastSeenAt: incoming.receivedAt.toISOString(),
+    isQuarantined: existing?.isQuarantined || false,
+    history: [...previousHistory, ...(incoming.endpoint.history || [])].slice(-200),
+    changeHistory: existing?.changeHistory || [],
+    telemetryEventIds: [...(existing?.telemetryEventIds || []), eventId].slice(-200)
+  };
+  addEndpointChange(record, 'TELEMETRY', 'pasopati_audit.py', 'agent', `Skor ${incoming.score}/100; PASS ${incoming.passed}, WARN ${incoming.warned}, FAIL ${incoming.failed}.`);
+  if (existing) records[records.findIndex(item => item.id === existing.id)] = record;
+  else records.push(record);
+  writeEndpointRecords(ENDPOINTS_PATH, records);
+  return { ...incoming, record, created: !existing, duplicate: false };
+}
+
+app.get('/api/endpoints', requireApiKey, rateLimit(120, 'endpoints-read'), (_req, res) => {
+  try {
+    const endpoints = endpointRecords().filter(endpoint => !endpoint.deletedAt)
+      .map(endpoint => {
+        const quarantine = [endpoint.id, endpoint.agentId, endpoint.name].filter(Boolean)
+          .map(key => quarantineRegistry.get(String(key))).find(Boolean);
+        return { ...endpoint, isQuarantined: quarantine ? quarantine.quarantined : endpoint.isQuarantined };
+      })
+      .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+    return res.json({ endpoints, total: endpoints.length, updatedAt: new Date().toISOString() });
+  } catch (err) {
+    console.error('[PASOPATI] Penyimpanan endpoint gagal dibaca:', (err as Error).message);
+    return res.status(500).json({ status: 'rejected', reason: 'Penyimpanan endpoint tidak dapat dibaca.' });
+  }
+});
+
+app.get('/api/endpoints/:id', requireApiKey, rateLimit(120, 'endpoint-read'), (req, res) => {
+  try {
+    const endpoint = endpointRecords().find(item => item.id === req.params.id && !item.deletedAt);
+    if (!endpoint) return res.status(404).json({ status: 'rejected', reason: 'Endpoint tidak ditemukan.' });
+    return res.json({ endpoint });
+  } catch (err) {
+    console.error('[PASOPATI] Penyimpanan endpoint gagal dibaca:', (err as Error).message);
+    return res.status(500).json({ status: 'rejected', reason: 'Penyimpanan endpoint tidak dapat dibaca.' });
+  }
+});
+
+app.post('/api/endpoints', requireRole('planner'), rateLimit(30, 'endpoint-write'), (req, res) => {
+  if (endpointBodyTooLarge(req, res)) return;
+  try {
+    const input = normalizeEndpointInput(req.body);
+    const records = endpointRecords();
+    const existing = findEndpointByIdentity(records, input);
+    const now = new Date().toISOString();
+    const actor = endpointActor(req);
+    const record: EndpointRecord = existing ? {
+      ...existing, ...input, id: existing.id, source: existing.source,
+      createdAt: existing.createdAt, updatedAt: now, created_at: existing.created_at || existing.createdAt,
+      updated_at: now, revision: (existing.revision || 1) + 1, changeHistory: existing.changeHistory || [],
+      history: input.history?.length ? input.history : existing.history,
+      isQuarantined: existing.isQuarantined
+    } : {
+      id: crypto.randomUUID(), name: input.name || input.hostname || 'Endpoint',
+      hostname: input.hostname || input.name || 'Endpoint', role: input.role || 'Endpoint',
+      os: input.os || 'Unknown', platformType: input.platformType || 'linux', ip: input.ip || '',
+      mac: input.mac || '', user: input.user || '', openPorts: input.openPorts || [], checks: input.checks || [],
+      isQuarantined: input.isQuarantined || false, history: input.history || [], agentId: input.agentId,
+      source: 'operator', createdAt: now, updatedAt: now, created_at: now, updated_at: now, revision: 1, changeHistory: []
+    };
+    addEndpointChange(record, existing ? 'UPDATE' : 'CREATE', actor, 'operator', existing ? 'Upsert melalui API operator.' : 'Endpoint didaftarkan operator.');
+    if (existing) records[records.findIndex(item => item.id === existing.id)] = record;
+    else records.push(record);
+    writeEndpointRecords(ENDPOINTS_PATH, records);
+    saveEndpointAudit(record, existing ? 'ENDPOINT UPDATE' : 'ENDPOINT CREATE', actor, record.name);
+    return res.status(existing ? 200 : 201).json({ status: 'success', created: !existing, endpoint: record });
+  } catch (err) {
+    const message = (err as Error).message;
+    const clientError = /wajib|harus|melebihi|maksimal|tidak valid|mengandung|format|berupa|karakter/i.test(message);
+    if (!clientError) console.error('[PASOPATI] Gagal menyimpan endpoint:', message);
+    return res.status(clientError ? 400 : 500).json({ status: 'rejected', reason: clientError ? message : 'Penyimpanan endpoint gagal; perubahan tidak dikonfirmasi.' });
+  }
+});
+
+app.put('/api/endpoints/:id', requireRole('planner'), rateLimit(30, 'endpoint-write'), (req, res) => {
+  if (endpointBodyTooLarge(req, res)) return;
+  try {
+    const records = endpointRecords();
+    const index = records.findIndex(item => item.id === req.params.id && !item.deletedAt);
+    if (index < 0) return res.status(404).json({ status: 'rejected', reason: 'Endpoint tidak ditemukan.' });
+    const patch = normalizeEndpointInput(req.body, true);
+    const current = records[index];
+    const currentRevision = Number.isSafeInteger(current.revision) && current.revision > 0 ? current.revision : 1;
+    const ifMatch = String(req.get('If-Match') || '').replace(/^"|"$/g, '');
+    const expectedRevision = req.body?.expected_revision ?? (ifMatch ? Number(ifMatch) : undefined);
+    if (!Number.isSafeInteger(expectedRevision) || Number(expectedRevision) < 1) {
+      return res.status(428).json({ status: 'rejected', reason: 'expected_revision wajib diisi; muat versi endpoint terbaru sebelum menyimpan.' });
+    }
+    if (Number(expectedRevision) !== currentRevision) {
+      return res.status(409).json({ status: 'conflict', reason: 'Endpoint berubah sejak browser terakhir memuatnya. Data terbaru dikirim untuk mencegah lost update.', current_revision: currentRevision, endpoint: current });
+    }
+    const now = new Date().toISOString();
+    const merged: EndpointRecord = { ...current, ...patch, id: current.id, source: current.source, createdAt: current.createdAt, updatedAt: now, created_at: current.created_at || current.createdAt, updated_at: now, revision: currentRevision + 1 };
+    if ((patch.agentId !== undefined || patch.mac !== undefined || patch.hostname !== undefined) &&
+        records.some(item => item.id !== current.id && !item.deletedAt && findEndpointByIdentity([item], merged))) {
+      return res.status(409).json({ status: 'rejected', reason: 'Identitas endpoint sudah terdaftar pada endpoint lain.' });
+    }
+    addEndpointChange(merged, 'UPDATE', endpointActor(req), 'operator', 'Endpoint diperbarui melalui API.');
+    records[index] = merged;
+    writeEndpointRecords(ENDPOINTS_PATH, records);
+    saveEndpointAudit(merged, 'ENDPOINT UPDATE', endpointActor(req), merged.name);
+    return res.json({ status: 'success', endpoint: merged });
+  } catch (err) {
+    const message = (err as Error).message;
+    const clientError = /wajib|harus|melebihi|maksimal|tidak valid|mengandung|format|berupa|karakter/i.test(message);
+    if (!clientError) console.error('[PASOPATI] Gagal memperbarui endpoint:', message);
+    return res.status(clientError ? 400 : 500).json({ status: 'rejected', reason: clientError ? message : 'Penyimpanan endpoint gagal; perubahan tidak dikonfirmasi.' });
+  }
+});
+
+app.delete('/api/endpoints/:id', requireRole('admin'), rateLimit(20, 'endpoint-delete'), (req, res) => {
+  try {
+    const records = endpointRecords();
+    const endpoint = records.find(item => item.id === req.params.id && !item.deletedAt);
+    if (!endpoint) return res.status(404).json({ status: 'rejected', reason: 'Endpoint tidak ditemukan.' });
+    const actor = endpointActor(req);
+    const now = new Date().toISOString();
+    endpoint.deletedAt = now;
+    endpoint.updatedAt = now;
+    endpoint.updated_at = now;
+    endpoint.revision = (endpoint.revision || 1) + 1;
+    addEndpointChange(endpoint, 'DELETE', actor, 'operator', 'Endpoint diarsipkan (soft delete).');
+    writeEndpointRecords(ENDPOINTS_PATH, records);
+    saveEndpointAudit(endpoint, 'ENDPOINT DELETE', actor, endpoint.name);
+    return res.json({ status: 'success', deleted: true, id: endpoint.id, deletedAt: now });
+  } catch (err) {
+    console.error('[PASOPATI] Gagal menghapus endpoint:', (err as Error).message);
+    return res.status(500).json({ status: 'rejected', reason: 'Penghapusan endpoint gagal; perubahan tidak dikonfirmasi.' });
+  }
+});
+
+app.post('/api/ingest', rateLimit(60, 'ingest'), (req, res) => {
   const auth = verifySignedRequest(
     req,
     HMAC_SECRET,
@@ -379,71 +885,78 @@ app.post('/api/ingest', rateLimit(60), (req, res) => {
   if (usedIngestSignatures.has(auth.signature)) {
     return res.status(401).json({ status: 'rejected', reason: 'Replay: tanda tangan ingest sudah pernah dipakai.' });
   }
-  recordIngestSignature(auth.signature);
-
-  const payload = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, any>;
-  const metadata = (payload.metadata && typeof payload.metadata === 'object' ? payload.metadata : {}) as Record<string, any>;
-  const scoring = (payload.scoring && typeof payload.scoring === 'object' ? payload.scoring : {}) as Record<string, any>;
-  const unit = String(metadata.tactical_unit || 'UNKNOWN-UNIT').slice(0, 64);
-  const score = Number(scoring.cyber_readiness_score) || 0;
-
-  // Record into Compliance Drift History (dibatasi agar memori tidak bocor).
-  if (!Object.hasOwn(complianceDriftStore, unit)) {
-    const units = Object.keys(complianceDriftStore);
-    if (units.length >= 200) delete complianceDriftStore[units[0]];
-    complianceDriftStore[unit] = [];
+  const rawBody = (req as Request & { rawBody?: Buffer }).rawBody;
+  if (rawBody && rawBody.length > MAX_ENDPOINT_BODY_BYTES) {
+    return res.status(413).json({ status: 'rejected', reason: 'Payload telemetri melebihi batas 1 MB.' });
   }
-  const drift = complianceDriftStore[unit];
-  drift.push({
-    timestamp: new Date().toISOString().replace('T', ' ').substring(0, 16),
-    score: score,
-    passCount: Number(scoring.passed_checks) || 0,
-    warnCount: Number(scoring.warning_checks) || 0,
-    failCount: Number(scoring.failed_checks) || 0,
-    event: 'Telemetry Ingest Puskodal'
-  });
-  if (drift.length > 200) drift.splice(0, drift.length - 200);
+  try {
+    const unitHeader = typeof req.headers['x-pasopati-unit'] === 'string' ? req.headers['x-pasopati-unit'] : undefined;
+    const eventId = crypto.createHash('sha256').update(auth.signature).digest('hex').slice(0, 32);
+    const stored = upsertAgentEndpoint(req.body, unitHeader, eventId);
+    const { unit, score, passed, warned, failed, total, receivedAt, record } = stored;
 
-  // Persist telemetry into the local audit database the dashboard reads.
-  // Sebelumnya ingest hanya menulis ke memori (complianceDriftStore) sehingga
-  // dashboard tidak pernah menampilkan telemetri agen meski server membalas 200.
-  const receivedAt = new Date();
-  const ingestEntry = {
-    id: `INGEST-${unit}-${receivedAt.getTime()}`,
-    timestamp: receivedAt.toISOString().replace('T', ' ').substring(0, 19),
-    deviceId: unit,
-    deviceName: unit,
-    deviceRole: String(metadata.device_role || 'Endpoint (telemetri agen)').slice(0, 160),
-    action: 'TELEMETRY INGESTION',
-    operator: 'pasopati_audit.py',
-    preScore: 0,
-    postScore: score,
-    changesSummary: `Telemetri audit bertanda tangan HMAC dari ${unit} (PASS ${Number(scoring.passed_checks) || 0} / WARN ${Number(scoring.warning_checks) || 0} / FAIL ${Number(scoring.failed_checks) || 0})`,
-    changesDetails: [
-      '[NYATA] Data berasal dari pasopati_audit.py di host, bukan simulasi dashboard.',
-      `Total parameter: ${Number(scoring.total_checks) || 0} | Skor: ${score}/100`
-    ],
-    status: 'SUCCESS',
-    storedInDb: true
-  };
-  const totalLogs = appendAuditLogs([ingestEntry]);
+    // Drift history is derived from the durable endpoint score history and also
+    // kept in memory for compatibility with existing dashboards.
+    if (!Object.hasOwn(complianceDriftStore, unit)) {
+      const units = Object.keys(complianceDriftStore);
+      if (units.length >= 200) delete complianceDriftStore[units[0]];
+      complianceDriftStore[unit] = [];
+    }
+    const drift = complianceDriftStore[unit];
+    if (!stored.duplicate) drift.push({
+      timestamp: receivedAt.toISOString().replace('T', ' ').substring(0, 16),
+      score, passCount: passed, warnCount: warned, failCount: failed,
+      event: 'Telemetry Ingest Puskodal'
+    });
+    if (drift.length > 200) drift.splice(0, drift.length - 200);
 
-  console.log(`[PUSKODAL-INGEST] Telemetri dari: ${unit} | Score: ${score}/100 | Cryptographic Signature: VALID`);
-  return res.json({
-    status: 'success',
-    message: `Telemetri dari ${unit} berhasil dicatat di Puskodal PASOPATI`,
-    tactical_unit: unit,
-    signature_verified: true,
-    stored: true,
-    total_logs: totalLogs,
-    timestamp: new Date().toISOString()
-  });
+    const ingestEntry = {
+      id: `INGEST-${record.id}-${eventId}`,
+      timestamp: receivedAt.toISOString().replace('T', ' ').substring(0, 19),
+      deviceId: record.id,
+      deviceName: record.name,
+      deviceRole: record.role,
+      action: 'TELEMETRY INGESTION',
+      operator: 'pasopati_audit.py',
+      preScore: 0,
+      postScore: score,
+      changesSummary: `Telemetri audit bertanda tangan HMAC dari ${unit} (PASS ${passed} / WARN ${warned} / FAIL ${failed})`,
+      changesDetails: [
+        '[NYATA] Telemetri dari agen PASOPATI; endpoint dan hasil compliance tersimpan di registry pusat.',
+        `Total parameter: ${total} | Skor: ${score}/100 | Host: ${record.hostname} | IP: ${record.ip || '—'} | MAC: ${record.mac || '—'}`
+      ],
+      status: 'SUCCESS',
+      storedInDb: true
+    };
+    const totalLogs = appendAuditLogs([ingestEntry], true);
+    recordIngestSignature(auth.signature);
+    console.log(`[PUSKODAL-INGEST] Telemetri dari: ${unit} | Endpoint: ${record.id} | Score: ${score}/100 | HMAC: valid`);
+    return res.json({
+      status: 'success',
+      message: `Telemetri dari ${unit} berhasil dicatat di Puskodal PASOPATI`,
+      tactical_unit: unit,
+      endpoint_id: record.id,
+      endpoint_created: stored.created,
+      signature_verified: true,
+      stored: true,
+      total_logs: totalLogs,
+      timestamp: receivedAt.toISOString()
+    });
+  } catch (err) {
+    const message = (err as Error).message;
+    const clientError = /wajib|harus|melebihi|maksimal|tidak valid|tidak cocok|berupa|karakter|melebihi/i.test(message);
+    if (!clientError) console.error('[PUSKODAL-INGEST] Gagal menyimpan telemetri:', message);
+    return res.status(clientError ? 400 : 500).json({
+      status: 'rejected',
+      reason: clientError ? message : 'Penyimpanan endpoint atau audit log gagal; telemetri tidak dikonfirmasi.'
+    });
+  }
 });
 
 
 // Emergency Network Quarantine Vector (Kill-Switch) — mencatat status; agen host yang
 // wajib mengeksekusi pemblokiran nyata (server tidak memutus koneksi endpoint sendiri).
-app.post('/api/quarantine', requireApiKey, rateLimit(60), (req, res) => {
+app.post('/api/quarantine', requireRole('executor'), rateLimit(60, 'quarantine'), (req, res) => {
   const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, any>;
   const unitId = String(body.unitId || '').trim().slice(0, 64);
   if (!unitId) {
@@ -472,8 +985,277 @@ app.get('/api/quarantine', requireApiKey, (_req, res) => {
 // Riwayat compliance drift per unit (diisi oleh /api/ingest).
 app.get('/api/compliance-drift/:unitId', requireApiKey, (req, res) => {
   const unitId = String(req.params.unitId || '').slice(0, 64);
-  const history = Object.hasOwn(complianceDriftStore, unitId) ? complianceDriftStore[unitId] : [];
-  return res.json({ unitId, history });
+  try {
+    const endpoint = endpointRecords().find(item => !item.deletedAt &&
+      (item.agentId === unitId || item.id === unitId || item.hostname === unitId));
+    const history = endpoint?.history || (Object.hasOwn(complianceDriftStore, unitId) ? complianceDriftStore[unitId] : []);
+    return res.json({ unitId, history });
+  } catch (err) {
+    console.error('[PASOPATI] Gagal memulihkan compliance drift:', (err as Error).message);
+    return res.status(500).json({ status: 'rejected', reason: 'Riwayat compliance tidak dapat dibaca.' });
+  }
+});
+
+// ===== Escrow kunci BitLocker =====
+// Redundansi selain file lokal di host: bila host terkunci / backup hilang,
+// operator masih bisa membuka volume. Disimpan 0600 di data/.
+const ESCROW_PATH = path.join(DATA_DIR, 'bitlocker_escrow.json');
+type EscrowEntry = { value: string; at: string };
+type EscrowDevice = { recovery?: EscrowEntry; bootpw?: EscrowEntry };
+const ESCROW_KINDS = new Set(['recovery', 'bootpw']);
+
+function loadEscrow(): Record<string, EscrowDevice> {
+  try {
+    if (!fs.existsSync(ESCROW_PATH)) return {};
+    const parsed = JSON.parse(fs.readFileSync(ESCROW_PATH, 'utf-8'));
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, EscrowDevice> : {};
+  } catch (err) {
+    console.error('[PASOPATI] Gagal membaca escrow BitLocker:', (err as Error).message);
+    return {};
+  }
+}
+
+function saveEscrow(store: Record<string, EscrowDevice>) {
+  try {
+    writeJsonAtomic(ESCROW_PATH, store);
+  } catch (err) {
+    console.error('[PASOPATI] Gagal menulis escrow BitLocker:', (err as Error).message);
+  }
+}
+
+const escrowStore = loadEscrow();
+
+app.post('/api/escrow', requireRole('executor', 'agent'), rateLimit(30, 'escrow'), (req, res) => {
+  const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, any>;
+  const deviceId = String(body.deviceId || '').trim().slice(0, 64);
+  const kind = String(body.kind || '').toLowerCase();
+  const value = String(body.value || '').trim();
+  if (!deviceId) return res.status(400).json({ status: 'rejected', reason: 'deviceId wajib diisi.' });
+  if (!ESCROW_KINDS.has(kind)) return res.status(400).json({ status: 'rejected', reason: 'kind harus recovery|bootpw.' });
+  if (!value || value.length > 400) return res.status(400).json({ status: 'rejected', reason: 'value wajib (maks 400 karakter).' });
+  const device = escrowStore[deviceId] || {};
+  device[kind as 'recovery' | 'bootpw'] = { value, at: new Date().toISOString() };
+  escrowStore[deviceId] = device;
+  saveEscrow(escrowStore);
+  console.log(`[PUSKODAL-ESCROW] ${kind} untuk ${deviceId} disimpan (${value.length} char).`);
+  return res.json({ status: 'success', deviceId, kind, stored: true });
+});
+
+app.get('/api/escrow/:deviceId', requireApiKey, (req, res) => {
+  const deviceId = String(req.params.deviceId || '').slice(0, 64);
+  return res.json({ deviceId, escrow: escrowStore[deviceId] || null });
+});
+
+// ===== Observability =====
+const STARTED_AT = Date.now();
+let APP_VERSION = '0.0.0';
+try {
+  APP_VERSION = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'package.json'), 'utf-8')).version || '0.0.0';
+} catch { /* abaikan */ }
+
+function healthSnapshot() {
+  const now = Date.now();
+  const active = Array.from(plansStore.values()).filter(p => p.status === 'APPROVED' || p.status === 'EXECUTING');
+  const stale = active.filter(p => p.status === 'EXECUTING' && p.heartbeatAt && now - Date.parse(String(p.heartbeatAt)) > STALE_EXECUTING_MS);
+  const silentHosts = hostsStore.filter(h => !h.revokedAt && h.lastSeenAt && now - Date.parse(String(h.lastSeenAt)) > 24 * 3600 * 1000);
+  const chain = verifyAuditChain(readAuditLogs());
+  return {
+    status: chain.ok && stale.length === 0 ? 'ok' : 'degraded',
+    version: APP_VERSION,
+    uptimeSec: Math.floor((now - STARTED_AT) / 1000),
+    activePlans: active.length,
+    staleExecuting: stale.map(p => p.planId),
+    auditChainOk: chain.ok,
+    auditBrokenAt: chain.brokenAt,
+    hosts: hostsStore.filter(h => !h.revokedAt).length,
+    silentHosts: silentHosts.map(h => h.hostId)
+  };
+}
+
+app.get('/api/health', requireRole('viewer', 'agent'), (_req, res) => {
+  const snapshot = healthSnapshot();
+  return res.status(snapshot.status === 'ok' ? 200 : 503).json(snapshot);
+});
+
+app.get('/api/metrics', requireRole('viewer'), (_req, res) => {
+  const h = healthSnapshot();
+  const lines = [
+    '# HELP pasopati_up Server hidup.',
+    '# TYPE pasopati_up gauge',
+    'pasopati_up 1',
+    '# HELP pasopati_version Versi aplikasi.',
+    '# TYPE pasopati_version gauge',
+    `pasopati_version{version="${h.version}"} 1`,
+    '# HELP pasopati_active_plans Plan aktif (APPROVED/EXECUTING).',
+    '# TYPE pasopati_active_plans gauge',
+    `pasopati_active_plans ${h.activePlans}`,
+    '# HELP pasopati_stale_executing Plan EXECUTING tanpa heartbeat.',
+    '# TYPE pasopati_stale_executing gauge',
+    `pasopati_stale_executing ${h.staleExecuting.length}`,
+    '# HELP pasopati_hosts Host aktif ter-enrol.',
+    '# TYPE pasopati_hosts gauge',
+    `pasopati_hosts ${h.hosts}`,
+    '# HELP pasopati_audit_chain_ok Integritas rantai audit (1 = valid).',
+    '# TYPE pasopati_audit_chain_ok gauge',
+    `pasopati_audit_chain_ok ${h.auditChainOk ? 1 : 0}`
+  ];
+  res.type('text/plain; version=0.0.4').send(lines.join('\n') + '\n');
+});
+
+// Manifest agen: hash SHA-256 + (opsional) tanda tangan HMAC dengan AGENT_SIGNING_KEY.
+// Dipakai untuk mendeteksi versi/berkas agen yang diubah sebelum remediasi.
+app.get('/api/agent/manifest', (_req, res) => {
+  const files = ['pasopati_audit.py', 'pasopati_remediate.py'];
+  const entries = files.map(name => {
+    try {
+      const full = path.resolve(process.cwd(), name);
+      return { name, sha256: crypto.createHash('sha256').update(fs.readFileSync(full)).digest('hex') };
+    } catch {
+      return { name, sha256: null };
+    }
+  });
+  const body: Record<string, unknown> = { version: APP_VERSION, generatedAt: new Date().toISOString(), files: entries };
+  const key = (process.env.AGENT_SIGNING_KEY || '').trim();
+  if (key) {
+    body.signature = crypto.createHmac('sha256', key).update(stableStringify(entries)).digest('hex');
+  }
+  return res.json(body);
+});
+
+// ===== Enrolment host & operator (RBAC) =====
+app.get('/api/whoami', requireApiKey, (req, res) => {
+  const principal = (req as Request & { principal?: Principal }).principal as Principal;
+  return res.json({ name: principal.name, role: principal.role, kind: principal.kind, hostId: principal.hostId });
+});
+
+app.get('/api/hosts', requireRole('viewer', 'agent'), (_req, res) => {
+  return res.json({
+    hosts: hostsStore.map(h => ({ hostId: h.hostId, name: h.name, createdAt: h.createdAt, lastSeenAt: h.lastSeenAt, revokedAt: h.revokedAt }))
+  });
+});
+
+app.post('/api/hosts/enroll', requireRole('admin'), (req, res) => {
+  const name = String(req.body?.name || '').trim().slice(0, 80) || 'host';
+  const hostKey = crypto.randomBytes(32).toString('hex');
+  const hostId = 'HOST-' + crypto.randomBytes(6).toString('hex');
+  hostsStore.push({ hostId, name, keyHash: sha256(hostKey), createdAt: new Date().toISOString() });
+  saveHosts();
+  console.log(`[PUSKODAL-HOST] Enrol ${hostId} (${name}).`);
+  return res.json({ status: 'success', hostId, name, hostKey });
+});
+
+app.post('/api/hosts/:hostId/revoke', requireRole('admin'), (req, res) => {
+  const host = hostsStore.find(h => h.hostId === String(req.params.hostId || ''));
+  if (!host) return res.status(404).json({ status: 'rejected', reason: 'Host tidak ditemukan.' });
+  if (host.revokedAt) return res.json({ status: 'success', hostId: host.hostId, revoked: true, alreadyRevoked: true });
+  host.revokedAt = new Date().toISOString();
+  saveHosts();
+  console.log(`[PUSKODAL-HOST] Cabut ${host.hostId}.`);
+  return res.json({ status: 'success', hostId: host.hostId, revoked: true });
+});
+
+// Antrean tarik untuk agent --watch: hanya plan terikat milik host ini.
+app.get('/api/hosts/me/plans', requireRole('agent'), (req, res) => {
+  const principal = (req as Request & { principal?: Principal }).principal as Principal;
+  const now = Date.now();
+  const plans = Array.from(plansStore.values())
+    .filter(p => p.status === 'APPROVED' && p.hostId === principal.hostId && (!p.expiresAt || p.expiresAt > now))
+    .map(p => ({ planId: p.planId, deviceId: p.deviceId, expiresAt: p.expiresAt, items: p.items.length }));
+  return res.json({ hostId: principal.hostId, plans });
+});
+
+app.get('/api/operators', requireRole('viewer'), (_req, res) => {
+  return res.json({
+    operators: operatorsStore.map(o => ({ name: o.name, role: o.role, createdAt: o.createdAt, lastSeenAt: o.lastSeenAt, revokedAt: o.revokedAt }))
+  });
+});
+
+app.post('/api/operators', requireRole('admin'), (req, res) => {
+  const name = String(req.body?.name || '').trim().slice(0, 80);
+  const role = String(req.body?.role || 'viewer') as Role;
+  if (!name) return res.status(400).json({ status: 'rejected', reason: 'name wajib diisi.' });
+  if (!OPERATOR_ROLES.includes(role)) {
+    return res.status(400).json({ status: 'rejected', reason: `role harus ${OPERATOR_ROLES.join('|')}.` });
+  }
+  if (operatorsStore.some(o => o.name === name && !o.revokedAt)) {
+    return res.status(409).json({ status: 'rejected', reason: 'Nama operator sudah dipakai.' });
+  }
+  const key = crypto.randomBytes(32).toString('hex');
+  operatorsStore.push({ name, role, keyHash: sha256(key), createdAt: new Date().toISOString() });
+  saveOperators();
+  console.log(`[PUSKODAL-OP] Operator ${name} (${role}) dibuat.`);
+  return res.json({ status: 'success', name, role, key });
+});
+
+app.post('/api/operators/:name/revoke', requireRole('admin'), (req, res) => {
+  const operator = operatorsStore.find(o => o.name === String(req.params.name || ''));
+  if (!operator) return res.status(404).json({ status: 'rejected', reason: 'Operator tidak ditemukan.' });
+  operator.revokedAt = operator.revokedAt || new Date().toISOString();
+  saveOperators();
+  return res.json({ status: 'success', name: operator.name, revoked: true });
+});
+
+// ===== Waiver / pengecualian temuan =====
+// Temuan yang disetujui tidak perlu diperbaiki sampai tanggal tertentu. WAIVED
+// dikeluarkan dari penyebut skor (bukan dihitung PASS palsu).
+const WAIVERS_PATH = path.join(DATA_DIR, 'waivers.json');
+interface WaiverRecord {
+  id: string; deviceId: string; parameter: string; reason: string; owner: string;
+  createdAt: string; expiresAt: string;
+}
+const waiversStore: WaiverRecord[] = readJsonArray<WaiverRecord>(WAIVERS_PATH);
+
+function saveWaivers() {
+  try { writeJsonAtomic(WAIVERS_PATH, waiversStore); } catch (err) {
+    console.error('[PASOPATI] Gagal menulis waivers:', (err as Error).message);
+  }
+}
+
+function activeWaivers(deviceId: string) {
+  const now = Date.now();
+  return waiversStore.filter(w => w.deviceId === deviceId && Date.parse(w.expiresAt) > now);
+}
+
+app.get('/api/waivers/:deviceId', requireRole('viewer', 'agent'), (req, res) => {
+  const deviceId = String(req.params.deviceId || '').slice(0, 64);
+  const includeExpired = String(req.query.includeExpired || '') === '1';
+  const list = includeExpired
+    ? waiversStore.filter(w => w.deviceId === deviceId)
+    : activeWaivers(deviceId);
+  return res.json({ deviceId, waivers: list });
+});
+
+app.post('/api/waivers', requireRole('planner'), (req, res) => {
+  const principal = (req as Request & { principal?: Principal }).principal as Principal;
+  const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, any>;
+  const deviceId = String(body.deviceId || '').trim().slice(0, 64);
+  const parameter = String(body.parameter || '').trim().slice(0, 200);
+  const reason = String(body.reason || '').trim().slice(0, 400);
+  const days = Math.min(Math.max(Number(body.days) || 30, 1), 365);
+  if (!deviceId || !parameter || !reason) {
+    return res.status(400).json({ status: 'rejected', reason: 'deviceId, parameter, dan reason wajib diisi.' });
+  }
+  const existing = activeWaivers(deviceId).find(w => w.parameter === parameter);
+  if (existing) {
+    return res.status(409).json({ status: 'rejected', reason: 'Temuan ini sudah punya waiver aktif.', waiver: existing });
+  }
+  const waiver: WaiverRecord = {
+    id: 'WV-' + crypto.randomBytes(6).toString('hex'),
+    deviceId, parameter, reason, owner: principal.name,
+    createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString()
+  };
+  waiversStore.push(waiver);
+  saveWaivers();
+  return res.json({ status: 'success', waiver });
+});
+
+app.delete('/api/waivers/:deviceId/:id', requireRole('approver'), (req, res) => {
+  const index = waiversStore.findIndex(w => w.deviceId === String(req.params.deviceId || '') && w.id === String(req.params.id || ''));
+  if (index === -1) return res.status(404).json({ status: 'rejected', reason: 'Waiver tidak ditemukan.' });
+  const [removed] = waiversStore.splice(index, 1);
+  saveWaivers();
+  return res.json({ status: 'success', waiver: removed });
 });
 
 // ===== Real Agent Remediation — kontrol plane (Fase B) =====
@@ -493,6 +1275,8 @@ interface PlanItem {
 interface Plan {
   planId: string;
   deviceId: string;
+  /** Host ter-enrol pemilik plan (opsional; plan lama tidak punya). */
+  hostId?: string;
   createdBy: string;
   createdAt: string;
   items: PlanItem[];
@@ -505,6 +1289,14 @@ interface Plan {
   signature?: string;
   evidence?: any[];
   updatedAt?: string;
+  /** Plan menyentuh jalur akses; approve wajib acknowledgeConsole=true. */
+  requiresConsoleAck?: boolean;
+  accessNotes?: string[];
+  /** Jejak heartbeat agent saat EXECUTING (deteksi agent mati). */
+  heartbeatAt?: string;
+  /** Hasil audit ulang pasca-remediasi (bukti perubahan nyata). */
+  postAudit?: { at: string; scoring?: Record<string, unknown>; matrix: Array<{ parameter: string; status: string; cis_id: string }> };
+  postAuditAt?: string;
 }
 
 const REMEDIATION_PLANS_PATH = path.join(DATA_DIR, 'remediation_plans.json');
@@ -540,6 +1332,38 @@ const ADVISORY_ALIASES = new Set([
   'advisory-secureboot',
   'advisory-admins'
 ]);
+// Satu plan hanya untuk satu host, jadi alias Windows dan Linux tidak boleh
+// dicampur: agent menolak alias OS lain dan seluruh plan akan batal.
+const WINDOWS_ALIASES = new Set([
+  'fw-enable-defender',
+  'guest-account-disable',
+  'usb-storage-block',
+  'rdp-nla-enable',
+  'uac-enable',
+  'bitlocker-enable',
+  'win-auditpol-process',
+  'ports-block-windows'
+]);
+const LINUX_ALIASES = new Set([
+  'fw-enable-ufw',
+  'ssh-disable-root',
+  'auditd-enable',
+  'usb-block-linux',
+  'grub-config-perms',
+  'sudoers-remove-nopasswd',
+  'suid-strip-critical',
+  'ports-block-linux'
+]);
+// Alias yang dapat memutus jalur akses operator. Plan yang memuat salah satunya
+// wajib di-approve dengan acknowledgeConsole=true (operator menyatakan sudah
+// punya konsol/KVM atau siap rollback), supaya tidak terkunci di luar host.
+const ACCESS_RISK_ALIASES: Record<string, string> = {
+  'ports-block-windows': 'Memblokir RDP 3389 inbound: sesi remote BARU tidak bisa masuk sampai rule dihapus.',
+  'ports-block-linux': 'Memblokir port 21/23/445/4444 via iptables (port 22 tidak diblokir).',
+  'ssh-disable-root': 'Login SSH langsung sebagai root tidak berlaku lagi untuk sesi baru.',
+  'fw-enable-ufw': 'UFW default deny incoming; pastikan jalur konsol tersedia sebelum menutup sesi.',
+  'fw-enable-defender': 'Windows Firewall dinyalakan di semua profil; sesi remote bisa terputus.'
+};
 const ALLOWED_TRANSITIONS: Record<PlanStatus, PlanStatus[]> = {
   PLANNED: ['APPROVED'],
   APPROVED: ['EXECUTING', 'VERIFIED', 'ROLLED_BACK', 'FAILED'],
@@ -548,6 +1372,32 @@ const ALLOWED_TRANSITIONS: Record<PlanStatus, PlanStatus[]> = {
   ROLLED_BACK: [],
   FAILED: []
 };
+
+// Parameter post-audit yang harus berstatus PASS/WARNING sebelum VERIFIED diterima.
+// Menutup celah "evidence bilang verified, host ternyata belum berubah".
+const ALIAS_POST_CHECK: Record<string, string[]> = {
+  'ports-block-linux': ['dangerous port', 'network & dangerous'],
+  'ports-block-windows': ['dangerous port', 'network & dangerous'],
+  'fw-enable-ufw': ['firewall'],
+  'fw-enable-defender': ['firewall', 'defender'],
+  'ssh-disable-root': ['ssh root', 'permitrootlogin'],
+  'auditd-enable': ['auditd', 'audit daemon'],
+  'usb-block-linux': ['usb'],
+  'usb-storage-block': ['usb'],
+  'grub-config-perms': ['grub'],
+  'sudoers-remove-nopasswd': ['sudoers', 'nopasswd'],
+  'suid-strip-critical': ['suid'],
+  'guest-account-disable': ['guest'],
+  'rdp-nla-enable': ['rdp', 'nla', '3389'],
+  'uac-enable': ['uac', 'user account control'],
+  'bitlocker-enable': ['bitlocker'],
+  'win-auditpol-process': ['event log', 'auditing', 'process creation']
+};
+
+// Antrean per host: satu plan aktif per perangkat, dan batas blast radius armada.
+const MAX_ACTIVE_PLANS = Math.max(Number(process.env.REMEDIATION_MAX_ACTIVE) || 10, 1);
+const STALE_EXECUTING_MS = Math.max(Number(process.env.REMEDIATION_STALE_MS) || 15 * 60 * 1000, 1000);
+const ACCEPTED_POST_STATUSES = new Set(['PASS', 'WARNING', 'N/A']);
 
 function loadPlans(): Map<string, Plan> {
   const map = new Map<string, Plan>();
@@ -678,10 +1528,18 @@ function validateItems(raw: any): PlanItem[] | null {
 }
 
 // 1. Operator/dashboard membuat rencana per temuan (belum ada eksekusi)
-app.post('/api/remediation-plan', requireApiKey, (req, res) => {
-  const { deviceId, items: rawItems, createdBy } = req.body || {};
+app.post('/api/remediation-plan', requireRole('planner'), (req, res) => {
+  const principal = (req as Request & { principal?: Principal }).principal as Principal;
+  const { deviceId, items: rawItems, hostId } = req.body || {};
   if (!deviceId || typeof deviceId !== 'string') {
     return res.status(400).json({ status: 'rejected', reason: 'deviceId wajib diisi.' });
+  }
+  let boundHostId: string | undefined;
+  if (hostId !== undefined && hostId !== null && String(hostId).trim() !== '') {
+    const host = hostsStore.find(h => h.hostId === String(hostId).trim());
+    if (!host) return res.status(400).json({ status: 'rejected', reason: 'hostId tidak dikenal. Enrol host dulu.' });
+    if (host.revokedAt) return res.status(400).json({ status: 'rejected', reason: 'hostId sudah dicabut.' });
+    boundHostId = host.hostId;
   }
   // PowerShell `ConvertTo-Json` mengirim item tunggal sebagai objek, bukan array.
   const items = validateItems(Array.isArray(rawItems) ? rawItems : rawItems ? [rawItems] : rawItems);
@@ -691,13 +1549,27 @@ app.post('/api/remediation-plan', requireApiKey, (req, res) => {
   if (!items.some(i => !ADVISORY_ALIASES.has(i.alias))) {
     return res.status(400).json({ status: 'rejected', reason: 'Plan harus punya minimal satu langkah enforce (advisory saja tidak cukup).' });
   }
+  const windowsItems = items.filter(i => WINDOWS_ALIASES.has(i.alias)).map(i => i.alias);
+  const linuxItems = items.filter(i => LINUX_ALIASES.has(i.alias)).map(i => i.alias);
+  if (windowsItems.length > 0 && linuxItems.length > 0) {
+    return res.status(400).json({
+      status: 'rejected',
+      reason: `Plan mencampur alias Windows (${windowsItems.join(', ')}) dan Linux (${linuxItems.join(', ')}). Pisahkan per OS.`
+    });
+  }
+  const accessNotes = items
+    .filter(i => ACCESS_RISK_ALIASES[i.alias])
+    .map(i => `${i.alias}: ${ACCESS_RISK_ALIASES[i.alias]}`);
   const plan: Plan = {
     planId: `PLAN-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
     deviceId: String(deviceId).slice(0, 64),
-    createdBy: String(createdBy || 'operator').slice(0, 80),
+    ...(boundHostId ? { hostId: boundHostId } : {}),
+    createdBy: principal.name,
     createdAt: new Date().toISOString(),
     items,
     status: 'PLANNED',
+    requiresConsoleAck: accessNotes.length > 0,
+    accessNotes,
     updatedAt: new Date().toISOString()
   };
   plansStore.set(plan.planId, plan);
@@ -709,25 +1581,78 @@ app.post('/api/remediation-plan', requireApiKey, (req, res) => {
 // Token boleh diterbitkan ulang HANYA jika token sebelumnya sudah kedaluwarsa, agar plan tidak macet.
 const TOKEN_TTL_MS = Math.max(Number(process.env.REMEDIATION_TOKEN_TTL_MS) || 10 * 60 * 1000, 100);
 const EVIDENCE_GRACE_MS = Math.max(Number(process.env.REMEDIATION_EVIDENCE_GRACE_MS) || 60 * 60 * 1000, TOKEN_TTL_MS); // batas kirim evidence setelah approval
-app.post('/api/remediation-approve', requireApiKey, (req, res) => {
+app.post('/api/remediation-approve', requireRole('approver'), (req, res) => {
   if (!HMAC_SECRET) {
     return res.status(503).json({ status: 'rejected', reason: 'Server belum siap: set HMAC_SECRET di environment.' });
   }
   const body = (req.body && typeof req.body === 'object' ? req.body : {}) as Record<string, any>;
   const plan = plansStore.get(String(body.planId || ''));
   if (!plan) return res.status(404).json({ status: 'rejected', reason: 'Plan tidak ditemukan.' });
-  if (plan.status !== 'PLANNED' && plan.status !== 'APPROVED') {
-    return res.status(409).json({ status: 'rejected', reason: `Transisi tidak diizinkan: ${plan.status} → APPROVED.` });
+  const principal = (req as Request & { principal?: Principal }).principal as Principal;
+  if (plan.createdBy === principal.name && body.selfApprove !== true) {
+    return res.status(409).json({
+      status: 'rejected',
+      reason: `Plan dibuat oleh ${plan.createdBy}. Empat mata: setujui oleh operator lain, atau kirim selfApprove=true.`
+    });
   }
   const force = body.force === true;
+  const override = force || body.overrideQueue === true;
+  // EXECUTING yang heartbeat-nya basi boleh diambil alih (agent mati / terputus).
+  const staleExecuting = plan.status === 'EXECUTING' && Boolean(plan.heartbeatAt) &&
+    Date.now() - Date.parse(String(plan.heartbeatAt)) > STALE_EXECUTING_MS;
+  if (plan.status !== 'PLANNED' && plan.status !== 'APPROVED' && !staleExecuting) {
+    return res.status(409).json({ status: 'rejected', reason: `Transisi tidak diizinkan: ${plan.status} → APPROVED.` });
+  }
+  if (!override) {
+    const active = Array.from(plansStore.values())
+      .filter(p => p.planId !== plan.planId && (p.status === 'APPROVED' || p.status === 'EXECUTING'));
+    const sameHost = active.find(p => p.deviceId === plan.deviceId);
+    if (sameHost) {
+      return res.status(409).json({
+        status: 'rejected',
+        reason: `Sudah ada plan aktif untuk ${plan.deviceId} (${sameHost.planId}, ${sameHost.status}). Selesaikan atau override dengan force=true.`,
+        blockingPlanId: sameHost.planId
+      });
+    }
+    if (active.length >= MAX_ACTIVE_PLANS) {
+      return res.status(409).json({
+        status: 'rejected',
+        reason: `Blast radius: ${active.length} plan aktif (maks ${MAX_ACTIVE_PLANS}). Override dengan overrideQueue=true bila memang disengaja.`,
+        activeCount: active.length
+      });
+    }
+  }
   if (!force && plan.status === 'APPROVED' && plan.expiresAt && Date.now() < plan.expiresAt) {
     return res.status(409).json({
       status: 'rejected',
       reason: 'Token lama masih berlaku. Tunggu hingga kedaluwarsa sebelum menerbitkan token baru (agar token agent tidak bentrok).'
     });
   }
-  plan.approvedBy = String(body.approvedBy || plan.approvedBy || 'operator').slice(0, 80);
-  plan.approvedAt = new Date().toISOString();
+  if (plan.requiresConsoleAck && body.acknowledgeConsole !== true) {
+    return res.status(409).json({
+      status: 'rejected',
+      reason: 'Plan menyentuh jalur akses host. Kirim acknowledgeConsole=true setelah memastikan ada konsol/KVM atau jalur rollback.',
+      requiresConsoleAck: true,
+      accessNotes: plan.accessNotes || []
+    });
+  }
+  const approvedAt = new Date().toISOString();
+  try {
+    appendEndpointHealthAuditRecord(ENDPOINT_HEALTH_AUDIT_DB_PATH, buildEndpointHealthAuditRecord({
+      eventType: 'REMEDIATION_APPROVED',
+      endpointId: plan.deviceId,
+      accessedBy: principal.name,
+      approvedBy: principal.name,
+      approvedAt,
+      planId: plan.planId
+    }));
+  } catch (err) {
+    console.error('[PASOPATI] Gagal menulis audit kondisi endpoint saat approval:', (err as Error).message);
+    return res.status(500).json({ status: 'rejected', reason: 'Persetujuan tidak diproses karena rekaman audit endpoint gagal disimpan.' });
+  }
+  plan.approvedBy = principal.name;
+  plan.approvedAt = approvedAt;
+  plan.heartbeatAt = staleExecuting ? undefined : plan.heartbeatAt;
   plan.nonce = crypto.randomBytes(32).toString('hex');
   plan.expiresAt = Date.now() + TOKEN_TTL_MS;
   plan.evidenceDeadline = Date.now() + EVIDENCE_GRACE_MS;
@@ -741,10 +1666,58 @@ app.post('/api/remediation-approve', requireApiKey, (req, res) => {
   return res.json({ status: 'success', planId: plan.planId, nonce: plan.nonce, expiresAt: plan.expiresAt, evidenceDeadline: plan.evidenceDeadline, signature: plan.signature, token: `${plan.nonce}.${plan.signature}`, plan: { ...plan } });
 });
 
+// Endpoint/health access audit is separate from /api/audit-logs and is admin-only.
+app.get('/api/admin/endpoint-health-audit', requireRole('admin'), rateLimit(120, 'endpoint-health-audit-read'), (req, res) => {
+  try {
+    const all = readEndpointHealthAuditRecords(ENDPOINT_HEALTH_AUDIT_DB_PATH);
+    const endpointId = typeof req.query.endpointId === 'string' ? req.query.endpointId : '';
+    const filtered = endpointId ? all.filter(record => record.target.endpointId === endpointId) : all;
+    const total = filtered.length;
+    const rawLimit = Number(req.query.limit);
+    const limit = Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 500) : 200;
+    const records = filtered.slice().sort((a, b) => b.occurredAt.localeCompare(a.occurredAt)).slice(0, limit);
+    return res.json({ records, total, limit, database: 'endpoint_health_audit.sqlite' });
+  } catch (err) {
+    console.error('[PASOPATI] Gagal membaca audit kondisi endpoint:', (err as Error).message);
+    return res.status(500).json({ status: 'rejected', reason: 'Database audit kondisi endpoint tidak dapat dibaca.' });
+  }
+});
+
+app.post('/api/admin/endpoint-health-audit/access', requireRole('admin'), rateLimit(60, 'endpoint-health-audit-access'), (req, res) => {
+  const endpointId = typeof req.body?.endpointId === 'string' ? req.body.endpointId.trim() : '';
+  if (!endpointId || endpointId.length > 120) {
+    return res.status(400).json({ status: 'rejected', reason: 'endpointId wajib berupa teks maksimal 120 karakter.' });
+  }
+  const endpoint = endpointRecords().find(item => item.id === endpointId && !item.deletedAt);
+  if (!endpoint) return res.status(404).json({ status: 'rejected', reason: 'Endpoint aktif tidak ditemukan.' });
+  try {
+    const principal = (req as Request & { principal?: Principal }).principal as Principal;
+    const relatedApproval = Array.from(plansStore.values())
+      .filter(plan => plan.approvedBy && [endpoint.id, endpoint.agentId, endpoint.hostname].includes(plan.deviceId))
+      .sort((a, b) => String(b.approvedAt || '').localeCompare(String(a.approvedAt || '')))[0];
+    const record = buildEndpointHealthAuditRecord({
+      eventType: 'ENDPOINT_ACCESSED',
+      endpointId: endpoint.id,
+      accessedBy: principal.name,
+      accessIp: String(req.ip || req.socket?.remoteAddress || 'unknown'),
+      ...(relatedApproval ? {
+        approvedBy: relatedApproval.approvedBy,
+        approvedAt: relatedApproval.approvedAt,
+        planId: relatedApproval.planId
+      } : {})
+    });
+    appendEndpointHealthAuditRecord(ENDPOINT_HEALTH_AUDIT_DB_PATH, record);
+    return res.status(201).json({ status: 'success', record });
+  } catch (err) {
+    console.error('[PASOPATI] Gagal menyimpan akses audit kondisi endpoint:', (err as Error).message);
+    return res.status(500).json({ status: 'rejected', reason: 'Rekaman akses kondisi endpoint tidak dapat disimpan.' });
+  }
+});
+
 // 3. Agent mengirim evidence eksekusi/verifikasi (setelah validasi nonce + signature + expiry + anti-replay)
 // Catatan jujur: status EXECUTING bersifat idempoten (nonce belum dikonsumsi) agar agent dapat
 // memanggil ulang; nonce baru dikonsumsi persisten pada VERIFIED/ROLLED_BACK/FAILED.
-app.post('/api/remediation-verify', requireApiKey, rateLimit(60), (req, res) => {
+app.post('/api/remediation-verify', requireRole('executor', 'agent'), rateLimit(60, 'evidence'), (req, res) => {
   const auth = verifySignedRequest(
     req,
     HMAC_SECRET,
@@ -757,6 +1730,10 @@ app.post('/api/remediation-verify', requireApiKey, rateLimit(60), (req, res) => 
   const { planId, nonce, toStatus, evidence } = body;
   const plan = plansStore.get(String(planId || ''));
   if (!plan) return res.status(404).json({ status: 'rejected', reason: 'Plan tidak ditemukan.' });
+  const principal = (req as Request & { principal?: Principal }).principal as Principal;
+  if (plan.hostId && principal.kind === 'host' && principal.hostId !== plan.hostId) {
+    return res.status(403).json({ status: 'rejected', reason: 'Plan ini terikat ke host lain.' });
+  }
   const target = String(toStatus || '').toUpperCase() as PlanStatus;
   if (!['EXECUTING', 'VERIFIED', 'ROLLED_BACK', 'FAILED'].includes(target)) {
     return res.status(400).json({ status: 'rejected', reason: 'toStatus tidak valid (EXECUTING|VERIFIED|ROLLED_BACK|FAILED).' });
@@ -790,17 +1767,79 @@ app.post('/api/remediation-verify', requireApiKey, rateLimit(60), (req, res) => 
     if (typeof e.alias !== 'string' || !ALIAS_REGEX.test(e.alias) || !ALLOWED_ALIASES.has(e.alias)) return res.status(400).json({ status: 'rejected', reason: 'Evidence alias tidak valid.' });
     if (!Number.isFinite(Number(e.exitCode))) return res.status(400).json({ status: 'rejected', reason: 'Evidence exitCode tidak valid.' });
     if (typeof e.outputHash !== 'string' || !e.outputHash) return res.status(400).json({ status: 'rejected', reason: 'Evidence outputHash wajib ada.' });
+    if (e.preStateHash !== undefined && typeof e.preStateHash !== 'string') return res.status(400).json({ status: 'rejected', reason: 'Evidence preStateHash harus string.' });
     if (!plan.items.some(i => i.alias === e.alias)) {
       return res.status(400).json({ status: 'rejected', reason: 'Evidence alias tidak ada dalam plan.' });
     }
   }
+  // stepIndex harus unik agar tidak ada langkah yang "dilaporkan dua kali".
+  const stepIndexes = ev.map(e => Number(e.stepIndex));
+  if (new Set(stepIndexes).size !== stepIndexes.length) {
+    return res.status(400).json({ status: 'rejected', reason: 'Evidence stepIndex duplikat.' });
+  }
+  // VERIFIED hanya boleh diklaim bila SELURUH langkah plan punya evidence,
+  // semua exitCode 0, dan setiap langkah enforce benar-benar terverifikasi.
+  // Status tidak lagi murni assertion agent.
+  if (target === 'VERIFIED') {
+    const evidenceAliases = new Set(ev.map(e => String(e.alias)));
+    const missing = plan.items.map(i => i.alias).filter(a => !evidenceAliases.has(a));
+    if (missing.length > 0) {
+      return res.status(400).json({ status: 'rejected', reason: `Evidence belum lengkap; langkah tanpa bukti: ${missing.join(', ')}.` });
+    }
+    const failedExit = ev.filter(e => Number(e.exitCode) !== 0).map(e => String(e.alias));
+    if (failedExit.length > 0) {
+      return res.status(400).json({ status: 'rejected', reason: `exitCode bukan 0 pada: ${failedExit.join(', ')}; gunakan FAILED/ROLLED_BACK.` });
+    }
+    const unverified = ev
+      .filter(e => !(e.advisory === true || ADVISORY_ALIASES.has(String(e.alias))) && e.verified !== true)
+      .map(e => String(e.alias));
+    if (unverified.length > 0) {
+      return res.status(400).json({ status: 'rejected', reason: `Langkah belum terverifikasi: ${unverified.join(', ')}.` });
+    }
+    // Audit ulang pasca-remediasi: bukti bahwa host benar-benar berubah.
+    const matrix = Array.isArray(body.postAudit?.compliance_matrix) ? body.postAudit.compliance_matrix : null;
+    if (!matrix) {
+      return res.status(400).json({ status: 'rejected', reason: 'VERIFIED wajib menyertakan postAudit.compliance_matrix hasil audit ulang.' });
+    }
+    const regressions: string[] = [];
+    for (const item of plan.items) {
+      if (ADVISORY_ALIASES.has(item.alias)) continue;
+      const keys = ALIAS_POST_CHECK[item.alias];
+      if (!keys) continue;
+      const hit = matrix.find((c: any) => c && typeof c === 'object' &&
+        keys.some(k => String(c.parameter ?? '').toLowerCase().includes(k)));
+      if (!hit) {
+        regressions.push(`${item.alias}: parameter terkait tidak ditemukan di hasil audit ulang`);
+        continue;
+      }
+      const status = String(hit.status ?? '').toUpperCase();
+      if (!ACCEPTED_POST_STATUSES.has(status)) {
+        regressions.push(`${item.alias}: parameter masih ${status || 'tanpa status'}`);
+      }
+    }
+    if (regressions.length > 0) {
+      return res.status(400).json({ status: 'rejected', reason: `Audit ulang belum bersih: ${regressions.join('; ')}.` });
+    }
+    plan.postAudit = {
+      at: new Date().toISOString(),
+      scoring: body.postAudit?.scoring && typeof body.postAudit.scoring === 'object' ? body.postAudit.scoring : undefined,
+      matrix: matrix.slice(0, 60).map((c: any) => ({
+        parameter: String(c?.parameter ?? '').slice(0, 200),
+        status: String(c?.status ?? '').slice(0, 20),
+        cis_id: String(c?.cis_id ?? '').slice(0, 120)
+      }))
+    };
+    plan.postAuditAt = new Date().toISOString();
+  }
 
   plan.status = target;
+  if (target === 'EXECUTING') plan.heartbeatAt = new Date().toISOString();
   const normalizedEvidence = ev.map(e => ({
     stepIndex: Number(e.stepIndex),
     alias: String(e.alias),
     exitCode: Number(e.exitCode),
     outputHash: String(e.outputHash).slice(0, 128),
+    ...(typeof e.preStateHash === 'string' ? { preStateHash: e.preStateHash.slice(0, 128) } : {}),
     ...(typeof e.output === 'string' ? { output: e.output.slice(0, 400) } : {}),
     verified: e.verified === true,
     advisory: e.advisory === true || ADVISORY_ALIASES.has(String(e.alias)),
@@ -864,9 +1903,13 @@ app.get('/api/remediation-plans', requireApiKey, (_req, res) => {
 
 // Endpoint khusus AGENT: mengembalikan plan LENGKAP (nonce+signature).
 // Dipakai `pasopati_remediate.py --plan-id` agar host target cukup punya script itu saja.
-app.get('/api/remediation-plans/:planId/agent', requireApiKey, rateLimit(30), (req, res) => {
+app.get('/api/remediation-plans/:planId/agent', requireRole('viewer', 'agent'), rateLimit(30, 'agent-plan'), (req, res) => {
   const plan = plansStore.get(req.params.planId);
   if (!plan) return res.status(404).json({ status: 'rejected', reason: 'Plan tidak ditemukan.' });
+  const principal = (req as Request & { principal?: Principal }).principal as Principal;
+  if (plan.hostId && principal.kind === 'host' && principal.hostId !== plan.hostId) {
+    return res.status(403).json({ status: 'rejected', reason: 'Plan ini terikat ke host lain.' });
+  }
   if (!plan.nonce || !plan.signature) {
     return res.status(409).json({ status: 'rejected', reason: 'Plan belum disetujui; approve dulu di dashboard.' });
   }
@@ -882,13 +1925,51 @@ app.get('/api/remediation-plans/:planId', requireApiKey, (req, res) => {
   return res.json({ plan: toPublicPlan(plan) });
 });
 
-// Local audit log persistence (JSON-file based local database)
+// Local audit log persistence (JSON-file based local database).
+// Integritas: setiap entri membawa `seq` + `prevHash` + `hash` (hash chain
+// SHA-256). `hash` hanya mencakup isi entri, sehingga soft-delete tidak
+// memutus rantai. GET menyertakan status rantai agar manipulasi file terlihat.
 const AUDIT_DB_PATH = path.join(DATA_DIR, 'audit_logs.json');
+const MAX_AUDIT_LOGS = 2000;
+const GENESIS_HASH = 'sha256:genesis';
 
 function ensureAuditDbDir() {
   if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
   }
+}
+
+function auditEntryHash(prevHash: string, entry: Record<string, any>): string {
+  const content: Record<string, any> = { ...entry };
+  delete content.hash;
+  delete content.prevHash;
+  delete content.seq;
+  delete content.deletedAt;
+  return 'sha256:' + crypto.createHash('sha256').update(`${prevHash}|${stableStringify(content)}`).digest('hex');
+}
+
+/** Bangun ulang seq/prevHash/hash secara deterministik untuk seluruh entri. */
+function sealAuditChain(logs: any[]): any[] {
+  let prev = GENESIS_HASH;
+  return logs.map((entry, index) => {
+    const sealed = { ...entry, seq: index + 1, prevHash: prev };
+    sealed.hash = auditEntryHash(prev, sealed);
+    prev = sealed.hash;
+    return sealed;
+  });
+}
+
+/** Verifikasi rantai apa adanya (tanpa memperbaiki) — mendeteksi suntingan luar. */
+function verifyAuditChain(logs: any[]): { ok: boolean; brokenAt: number | null } {
+  let prev = GENESIS_HASH;
+  for (let i = 0; i < logs.length; i++) {
+    const expected = auditEntryHash(prev, logs[i]);
+    if (Number(logs[i]?.seq) !== i + 1 || String(logs[i]?.prevHash) !== prev || String(logs[i]?.hash) !== expected) {
+      return { ok: false, brokenAt: i + 1 };
+    }
+    prev = expected;
+  }
+  return { ok: true, brokenAt: null };
 }
 
 function readAuditLogs(): any[] {
@@ -904,37 +1985,72 @@ function readAuditLogs(): any[] {
   }
 }
 
+function readAuditLogsStrict(): any[] {
+  ensureAuditDbDir();
+  if (!fs.existsSync(AUDIT_DB_PATH)) return [];
+  const parsed = JSON.parse(fs.readFileSync(AUDIT_DB_PATH, 'utf-8'));
+  if (!Array.isArray(parsed)) throw new Error('audit_logs.json tidak berisi array; data tidak ditimpa.');
+  return parsed;
+}
+
 function writeAuditLogs(logs: any[]) {
   try {
     ensureAuditDbDir();
-    writeJsonAtomic(AUDIT_DB_PATH, logs);
+    // Reseal selalu: file lama (pra-hash chain) otomatis dimigrasikan.
+    writeJsonAtomic(AUDIT_DB_PATH, sealAuditChain(logs.slice(-MAX_AUDIT_LOGS)));
+    return true;
   } catch (err) {
     console.error('[PASOPATI] Gagal menulis local audit database:', (err as Error).message);
+    return false;
   }
 }
 
-function appendAuditLogs(entries: any[]) {
+/** Tambah entri (id duplikat diabaikan) — dipakai ingest & evidence remediasi. */
+function appendAuditLogs(entries: any[], strict = false) {
   if (!Array.isArray(entries) || entries.length === 0) return 0;
-  const existing = readAuditLogs();
-  const byId = new Map<string, any>();
-  for (const l of existing) byId.set(String(l.id), l);
-  for (const l of entries) byId.set(String(l.id), l);
-  const merged = Array.from(byId.values())
-    .sort((a, b) => String(b.timestamp || '').localeCompare(String(a.timestamp || '')))
-    .slice(0, 2000);
-  writeAuditLogs(merged);
+  const existing = strict ? readAuditLogsStrict() : readAuditLogs();
+  const known = new Set(existing.map(l => String(l.id)));
+  const fresh = entries.filter(l => l && !known.has(String(l.id)));
+  if (fresh.length === 0) return existing.length;
+  const merged = [...existing, ...fresh].slice(-MAX_AUDIT_LOGS);
+  const persisted = writeAuditLogs(merged);
+  if (strict && !persisted) throw new Error('Audit log tidak dapat ditulis ke penyimpanan permanen.');
   return merged.length;
 }
 
 app.get('/api/audit-logs', requireApiKey, (req, res) => {
-  const limit = Math.min(Math.max(Number(req.query.limit) || 2000, 1), 2000);
+  const limit = Math.min(Math.max(Number(req.query.limit) || 2000, 1), MAX_AUDIT_LOGS);
   const offset = Math.max(Number(req.query.offset) || 0, 0);
-  const all = readAuditLogs().sort((a, b) => String(b.timestamp || '').localeCompare(String(a.timestamp || '')));
-  const logs = all.slice(offset, offset + limit);
-  return res.json({ logs, total: all.length, offset, limit });
+  const all = readAuditLogs();
+  const includeDeleted = String(req.query.includeDeleted || '') === '1';
+  const visible = (includeDeleted ? all : all.filter(l => !l.deletedAt)).slice().reverse(); // terbaru dulu
+  const chain = verifyAuditChain(all);
+  const logs = visible.slice(offset, offset + limit);
+  return res.json({
+    logs,
+    total: visible.length,
+    offset,
+    limit,
+    chainOk: chain.ok,
+    chainBrokenAt: chain.brokenAt,
+    deletedCount: all.filter(l => l.deletedAt).length
+  });
 });
 
-app.post('/api/audit-logs', requireApiKey, (req, res) => {
+// Verifikasi rantai audit (untuk laporan / pemeriksa eksternal).
+app.get('/api/audit-logs/verify', requireApiKey, (_req, res) => {
+  const all = readAuditLogs();
+  const chain = verifyAuditChain(all);
+  return res.status(chain.ok ? 200 : 409).json({
+    status: chain.ok ? 'success' : 'rejected',
+    chainOk: chain.ok,
+    brokenAt: chain.brokenAt,
+    entries: all.length,
+    deleted: all.filter(l => l.deletedAt).length
+  });
+});
+
+app.post('/api/audit-logs', requireRole('executor', 'agent'), (req, res) => {
   const body = req.body;
   const incoming = Array.isArray(body) ? body : Array.isArray(body?.logs) ? body.logs : [];
   if (!Array.isArray(incoming) || incoming.length === 0) {
@@ -943,7 +2059,7 @@ app.post('/api/audit-logs', requireApiKey, (req, res) => {
 
   const MAX_PER_REQUEST = 200;
   const cleaned = incoming.slice(0, MAX_PER_REQUEST).map((e: any) => ({
-    id: typeof e?.id === 'string' ? e.id.slice(0, 80) : `LOG-${Date.now()}`,
+    id: typeof e?.id === 'string' ? e.id.slice(0, 80) : `LOG-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
     timestamp: typeof e?.timestamp === 'string' ? e.timestamp.slice(0, 40) : new Date().toISOString().replace('T', ' ').substring(0, 19),
     deviceId: typeof e?.deviceId === 'string' ? e.deviceId.slice(0, 64) : 'UNKNOWN',
     deviceName: typeof e?.deviceName === 'string' ? e.deviceName.slice(0, 120) : 'UNKNOWN',
@@ -973,31 +2089,35 @@ app.post('/api/audit-logs', requireApiKey, (req, res) => {
       : {})
   }));
 
-  const existing = readAuditLogs();
-  const byId = new Map<string, any>();
-  for (const l of existing) byId.set(String(l.id), l);
-  for (const l of cleaned) byId.set(String(l.id), l);
-  const merged = Array.from(byId.values())
-    .sort((a, b) => String(b.timestamp || '').localeCompare(String(a.timestamp || '')))
-    .slice(0, 2000);
-  writeAuditLogs(merged);
+  const before = readAuditLogs().length;
+  const total = appendAuditLogs(cleaned);
   return res.json({
     status: 'success',
     received: incoming.length,
-    added: cleaned.length,
+    added: Math.max(total - before, 0),
     rejected: Math.max(incoming.length - cleaned.length, 0),
-    total: merged.length
+    total
   });
 });
 
-app.delete('/api/audit-logs', requireApiKey, (_req, res) => {
-  writeAuditLogs([]);
-  return res.json({ status: 'success' });
+// Soft delete: isi dipertahankan (rantai utuh) dan ditandai deletedAt.
+app.delete('/api/audit-logs', requireRole('admin'), (_req, res) => {
+  const all = readAuditLogs();
+  const now = new Date().toISOString();
+  let marked = 0;
+  for (const entry of all) {
+    if (!entry.deletedAt) {
+      entry.deletedAt = now;
+      marked += 1;
+    }
+  }
+  if (marked > 0) writeAuditLogs(all);
+  return res.json({ status: 'success', softDeleted: marked, retained: all.length });
 });
 
 // Direct Downloads for Jury Evaluation & Field Deployment
-// Download script PASOPATI. Alias /api/download/pasopati_agent.py tetap dilayani
-// agar tautan lama tidak 404.
+// Nama kanonis: pasopati_audit.py / pasopati_remediate.py.
+// /api/download/pasopati_agent.py tetap dilayani sebagai alias agar tautan lama tidak 404.
 function serveScript(res: Response, file: string) {
   const filePath = path.resolve(process.cwd(), file);
   if (fs.existsSync(filePath)) {
@@ -1009,6 +2129,12 @@ function serveScript(res: Response, file: string) {
 app.get('/api/download/pasopati_audit.py', (_req, res) => serveScript(res, 'pasopati_audit.py'));
 app.get('/api/download/pasopati_remediate.py', (_req, res) => serveScript(res, 'pasopati_remediate.py'));
 app.get('/api/download/pasopati_agent.py', (_req, res) => serveScript(res, 'pasopati_audit.py'));
+// Skrip orkestrasi uji lapangan untuk laptop target (LAN).
+app.get('/api/download/run-windows-test.ps1', (_req, res) => {
+  const filePath = path.resolve(process.cwd(), 'docs', 'run-windows-test.ps1');
+  if (!fs.existsSync(filePath)) return res.status(404).send('File run-windows-test.ps1 tidak ditemukan');
+  res.download(filePath, 'run-windows-test.ps1');
+});
 
 // Download app.py (Streamlit dashboard)
 app.get('/api/download/app.py', (_req, res) => {
@@ -1175,7 +2301,7 @@ function runHostAuditAgent(unit: string): Promise<any> {
 
 // Live Container/Host Scan Execution — delegates to the standalone deep agent.
 // No fabricated fallback: if the agent is unavailable we fail honestly (503).
-app.post('/api/scan-host', requireApiKey, asyncHandler(async (req, res) => {
+app.post('/api/scan-host', requireRole('executor'), asyncHandler(async (req, res) => {
   const rawUnitName = (req.body && typeof req.body === 'object' ? (req.body as any).unitName : '');
   const targetUnit = String(rawUnitName || 'PASOPATI-HOST-RUNTIME').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 64);
   try {
@@ -1207,8 +2333,66 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   });
 });
 
+// Kunci DATA_DIR: cegah dua server berbagi file state yang sama (tulis JSON
+// read-modify-write tidak aman lintas proses). Lock basi (pid mati) ditimpa.
+const LOCK_PATH = path.join(DATA_DIR, '.server.lock');
+
+function acquireDataLock() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    let ownsLock = false;
+    for (let attempt = 0; attempt < 2 && !ownsLock; attempt++) {
+      let descriptor: number | undefined;
+      let createdByThisAttempt = false;
+      try {
+        descriptor = fs.openSync(LOCK_PATH, 'wx', 0o600);
+        createdByThisAttempt = true;
+        fs.writeFileSync(descriptor, String(process.pid), 'utf-8');
+        fs.fsyncSync(descriptor);
+        fs.closeSync(descriptor);
+        descriptor = undefined;
+        ownsLock = true;
+      } catch (err: any) {
+        if (descriptor !== undefined) {
+          try { fs.closeSync(descriptor); } catch { /* preserve original error */ }
+        }
+        if (createdByThisAttempt) {
+          try { fs.unlinkSync(LOCK_PATH); } catch { /* startup will fail closed below */ }
+          throw err;
+        }
+        if (err?.code !== 'EEXIST') throw err;
+        const pid = Number(fs.readFileSync(LOCK_PATH, 'utf-8').trim());
+        if (!Number.isInteger(pid) || pid <= 0) throw new Error('Lock DATA_DIR ada tetapi PID tidak valid; periksa .server.lock secara manual.', { cause: err });
+        let alive = false;
+        try {
+          process.kill(pid, 0);
+          alive = true;
+        } catch (probeError: any) {
+          if (probeError?.code === 'EPERM') alive = true;
+          else if (probeError?.code !== 'ESRCH') throw probeError;
+        }
+        if (alive) throw new Error(`DATA_DIR sedang dipakai proses lain (pid ${pid}); hentikan proses lama atau gunakan PASOPATI_DATA_DIR berbeda.`, { cause: err });
+        fs.unlinkSync(LOCK_PATH);
+      }
+    }
+    if (!ownsLock) throw new Error('Tidak dapat memperoleh lock eksklusif untuk DATA_DIR.');
+    const release = () => {
+      try {
+        if (fs.readFileSync(LOCK_PATH, 'utf-8').trim() === String(process.pid)) fs.unlinkSync(LOCK_PATH);
+      } catch { /* abaikan */ }
+    };
+    process.on('exit', release);
+    process.on('SIGINT', () => { release(); process.exit(0); });
+    process.on('SIGTERM', () => { release(); process.exit(0); });
+  } catch (err) {
+    console.error('[PASOPATI] Lock DATA_DIR gagal dipasang; server tidak akan start:', (err as Error).message);
+    process.exit(1);
+  }
+}
+
 async function startServer() {
   const isDev = process.env.NODE_ENV !== 'production';
+  acquireDataLock();
 
   if (isDev) {
     const vite = await createViteServer({
@@ -1231,9 +2415,15 @@ async function startServer() {
     });
   }
 
-  const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[PASOPATI] Command Center server running at http://0.0.0.0:${PORT}`);
-  });
+  const tlsCertPath = process.env.TLS_CERT;
+  const tlsKeyPath = process.env.TLS_KEY;
+  const useTls = Boolean(tlsCertPath && tlsKeyPath);
+  const onListen = () => {
+    console.log(`[PASOPATI] Command Center server running at ${useTls ? 'https' : 'http'}://0.0.0.0:${PORT}`);
+  };
+  const server = useTls
+    ? https.createServer({ cert: fs.readFileSync(String(tlsCertPath)), key: fs.readFileSync(String(tlsKeyPath)) }, app).listen(PORT, '0.0.0.0', onListen)
+    : app.listen(PORT, '0.0.0.0', onListen);
 
   server.on('error', (err: any) => {
     if (err.code === 'EADDRINUSE') {

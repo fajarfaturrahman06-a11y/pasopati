@@ -1,20 +1,42 @@
 ﻿# PASOPATI - CHECKPOINT PENGERJAAN
-Terakhir diperbarui: 08 Nov 2026 - remediasi audit tahap 1-4 selesai
+Terakhir diperbarui: 14 Nov 2026 - pengerasan produksi tahap 1 selesai
 PENTING: Baca file ini dulu saat melanjutkan.
 CATATAN PENELITIAN: docs/RESEARCH-LOG-2026-11-12.md (analisis + sisa pekerjaan produksi).
 
 ================================================================
+PEMBARUAN 14 Nov 2026 - PENGERASAN PRODUKSI TAHAP 1
+================================================================
+Rincian + bukti uji: docs/AUDIT-2026-11-14.md.
+- Repo git dibuat (sebelumnya .git KOSONG): baseline commit 3c52b6a.
+- Gate jalur akses: requiresConsoleAck + acknowledgeConsole, preflight agent,
+  --force-access-risk, RDP 3389 di runbook + banner + badge.
+- Sudoers: atomik + visudo -c, cloud-init tanpa password dikecualikan.
+- VERIFIED dinilai server (evidence lengkap/stepIndex unik/exitCode 0/verified).
+- Audit log hash-chain + /api/audit-logs/verify + soft delete.
+- Rate limit per endpoint (bukan satu bucket global).
+- Dead-man rollback otomatis + escrow kunci BitLocker + persistensi iptables.
+- FASE 2: VERIFIED wajib audit ulang (postAudit), antrean per host + heartbeat + --resume,
+  lock DATA_DIR, timestamp server.
+- FASE 3: identitas per host + kunci host, RBAC empat mata, pencabutan, TLS opsional.
+- FASE 4: audit Windows 22 param + Linux ±18, waiver, health/metrics, agent --watch + deploy/,
+  app.py DEPRECATED.
+- FASE 5: profil deklaratif (64 Windows/73 Linux), manifest hash+tanda tangan, verifikasi artefak,
+  AI_DISABLED untuk air-gapped.
+BELUM: mTLS, MFA, konten profil resmi, escrow terenkripsi, DB transaksional,
+uji lapangan dead-man/--watch, update bertanda tangan.
+
+================================================================
 PEMBARUAN 12 Nov 2026 - REBRANDING PASOPATI + DASHBOARD BARU
 ================================================================
-- Nama produk: SATRIA-GUARD -> PASOPATI (Protokol Audit Sistem & Operasi
+- Nama produk: **PASOPATI** (Protokol Audit Sistem & Operasi
   Pengamanan Agen TI). Logo: public/pasopati.jpeg + public/pasopati-mark.png.
-- Script: satria_audit.py -> pasopati_audit.py, satria_remediate.py ->
-  pasopati_remediate.py (endpoint lama tetap alias).
+- Script: `pasopati_audit.py` + `pasopati_remediate.py`; alias unduhan lama
+  tetap dilayani agar tautan yang sudah beredar tidak 404.
 - Dashboard React: sidebar + topbar (pencarian endpoint) + 4 KPI + grafik
   temuan/tren + tabel aktivitas + status armada.
 - app.py: CSS diekstrak ke assets/pasopati.css (app.py ~1570 baris).
-- Identifier teknis kini sepenuhnya memakai X-Pasopati-API-Key / PASOPATI_API_KEY
-  agar konsisten dengan branding PASOPATI di seluruh kode dan dokumentasi.
+- Identifier teknis X-Pasopati-API-Key / PASOPATI_API_KEY dipertahankan agar
+  kompatibel dengan .env dan deployment yang sudah ada.
 
 ================================================================
 PEMBARUAN 12 Nov 2026 - PEMISAHAN SCRIPT PEMERIKSAAN vs PERBAIKAN
@@ -176,9 +198,9 @@ UJI NYATA VM (Kali + Windows10) 08 Nov 2026
 - Kali Linux (NAT 127.0.0.1:2222, kali/kali): audit skor 50 PASS4 WARN2 FAIL4; user biasa firewall WARNING (izin), USB WARNING.
 - Kali netns root: firewall PASS; netns kosong FAIL; +rule DROP 445 PASS; policy INPUT DROP PASS (false PASS lama hilang).
 - Kali USB: pasopati-usb-lock.conf di /etc/modprobe.d -> PASS; file cleanup.
-- Windows10 (NAT 127.0.0.1:2223 -> 10.0.2.15:22): user lokal voids (display "void sector"), PIN Hello Kucing12 diterima; password voids tidak pernah dibuat (SSH ditolak).
-- Windows: install OpenSSH.Server, sshd Automatic, banner SSH-2.0-OpenSSH_for_Windows_7.7; buat user pasopati/Kucing12 (admin) untuk SSH uji.
-- Windows: Python embed 3.12.7 di C:\Users\pasopati\py; pasopati_audit.py disalin ke C:\Users\pasopati.
+- Windows10 (NAT 127.0.0.1:2223 -> 10.0.2.15:22): user lokal uji (display "void sector"), PIN Hello diterima; password user biasa tidak pernah dibuat (SSH ditolak).
+- Windows: install OpenSSH.Server, sshd Automatic, banner SSH-2.0-OpenSSH_for_Windows_7.7; buat user uji (admin) untuk SSH uji.
+- Windows: Python embed 3.12.7 di profil user uji; pasopati_audit.py disalin ke folder home user tersebut.
 - Windows firewall Public OFF -> agent skor 56 PASS2 WARN5 FAIL1 (Firewall FAIL, benar); Public ON -> skor 68 PASS3 WARN5 FAIL0 (Firewall PASS). Firewall dikembalikan ON.
 - Kendala diatasi: lock screen frozen (reset), black screen sesudah Welcome (tunggu+tombol), tombol Win butuh scancode E0, putstring gagal di secure desktop (scancode untuk PIN), SSH tanpa banner (install OpenSSH), UAC (user tekan Yes).
 - Sisa: none untuk scope uji ini; agent terpantau bekerja di Linux & Windows nyata.
@@ -321,7 +343,7 @@ OPERASIONAL + HARDENING REPO (selesai hari ini - 06 Nov 2026)
 - Install auditd+ufw di WSL pilot: PLAN-1793981978857-617214 (fw-enable-ufw) VERIFIED (Status:active).
 - PLAN-1793981830923-770127 (auditd-enable) ROLLED_BACK benar (kernel WSL menolak audit); perlu baremetal.
 - PLAN-1793980530306-587887 (usb-block-linux) VERIFIED sebelumnya; file rollback manual dihapus (host bersih).
-- Hardening repo: TACTICAL_SECRET_2026 dipurge dari seluruh riwayat via git filter-repo (hash baru 1841afb..24c5057).
+- Hardening repo: secret legacy yang dulu ter-hardcode dipurge dari seluruh riwayat via git filter-repo (hash baru 1841afb..24c5057).
 - Dokumentasi baremetal BitLocker/LUKS: CATATAN-PENGEMBANGAN.md §9. README allowlist 10 alias diperbarui.
 - File test plan-*.json + server test sudah dibersihkan; .env yg baru tidak ter-commit.
 
@@ -362,4 +384,4 @@ CATATAN SECURITY (JANGAN DILANGGAR)
 - Hanya alias di allowlist yang diizinkan (bukan raw shell).
 - Setiap perubahan wajib backup dulu + verifikasi sesudahnya.
 - Rollback = restore dari snapshot, bukan ganti teks.
-- Secret lama TACTICAL_SECRET_2026 sudah dibersihkan dari riwayat; jangan dipakai lagi (dianggap bocor).
+- Secret legacy yang pernah ter-hardcode sudah dibersihkan dari riwayat; jangan dipakai lagi (dianggap bocor).

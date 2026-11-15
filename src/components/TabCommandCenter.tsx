@@ -4,9 +4,7 @@ import {
   CheckCircle,
   AlertTriangle,
   XCircle,
-  Server,
   Terminal,
-  ShieldAlert,
   MonitorSmartphone,
   Gauge,
   ScrollText,
@@ -16,6 +14,7 @@ import {
 import { AuditLogEntry, DeviceInfo } from '../types';
 import { calculateDeviceScore, calculateFleetScore } from '../data/mockDevices';
 import { sfx } from '../utils/audio';
+import { EndpointRegistryPanel, type EndpointDraftPayload, type EndpointSyncStatus } from './EndpointRegistryPanel';
 
 interface TabCommandCenterProps {
   devices: DeviceInfo[];
@@ -24,6 +23,13 @@ interface TabCommandCenterProps {
   onSelectDevice: (deviceId: string) => void;
   onAuditFinished: () => void;
   onNavigate: (tab: number) => void;
+  endpointSyncStatus: EndpointSyncStatus;
+  centralEndpointData: boolean;
+  canManageEndpoints: boolean;
+  canDeleteEndpoints: boolean;
+  lastEndpointSync: string | null;
+  onSaveEndpoint: (payload: EndpointDraftPayload, id?: string, expectedRevision?: number) => Promise<void>;
+  onDeleteEndpoint: (id: string) => Promise<void>;
 }
 
 const ACTION_LABEL: Record<AuditLogEntry['action'], string> = {
@@ -40,7 +46,14 @@ export const TabCommandCenter: React.FC<TabCommandCenterProps> = ({
   auditLogs,
   onSelectDevice,
   onAuditFinished,
-  onNavigate
+  onNavigate,
+  endpointSyncStatus,
+  centralEndpointData,
+  canManageEndpoints,
+  canDeleteEndpoints,
+  lastEndpointSync,
+  onSaveEndpoint,
+  onDeleteEndpoint
 }) => {
   const [isAuditing, setIsAuditing] = useState(false);
   const [auditProgress, setAuditProgress] = useState(0);
@@ -451,62 +464,20 @@ export const TabCommandCenter: React.FC<TabCommandCenterProps> = ({
       </div>
 
       {/* Fleet list */}
-      <div className="pasopati-panel">
-        <div className="pasopati-panel-header">
-          <div>
-            <h2 className="text-[14px] font-bold text-slate-100">Status Armada Endpoint</h2>
-            <p className="mt-0.5 text-[10.5px] font-mono text-slate-500">
-              Pilih endpoint untuk audit mendalam
-            </p>
-          </div>
-          <span className="rounded-md border border-[#2a3140] bg-[#12161e] px-2 py-1 font-mono text-[10px] text-slate-400">
-            {devices.length} ASET
-          </span>
-        </div>
-        <div className="grid grid-cols-1 gap-2 p-4 md:grid-cols-2">
-          {devices.map(device => {
-            const score = calculateDeviceScore(device.checks);
-            const failCount = device.checks.filter(c => c.status === 'FAIL').length;
-            const barColor = score >= 75 ? 'bg-emerald-500' : score >= 50 ? 'bg-amber-500' : 'bg-rose-500';
-            const textColor = score >= 75 ? 'text-emerald-400' : score >= 50 ? 'text-amber-400' : 'text-rose-400';
-            return (
-              <button
-                key={device.id}
-                onClick={() => {
-                  sfx.playClick();
-                  onSelectDevice(device.id);
-                }}
-                className="group flex items-center gap-3 rounded-lg border border-[#232936] bg-[#12161e] px-3.5 py-3 text-left transition-colors hover:border-rose-500/40 hover:bg-[#171c25]"
-              >
-                <span className="rounded-lg border border-[#2a3140] bg-[#0f131a] p-2 text-slate-400 group-hover:text-rose-300">
-                  <Server className="h-4 w-4" />
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="flex items-center gap-2">
-                    <span className="truncate text-[12.5px] font-bold text-slate-200">{device.name}</span>
-                    <span className="rounded border border-[#2a3140] bg-[#0d1016] px-1.5 py-0.5 font-mono text-[8.5px] uppercase text-slate-500">
-                      {device.platformType}
-                    </span>
-                  </span>
-                  <span className="mt-0.5 block truncate font-mono text-[10px] text-slate-500">
-                    {device.role} · {device.ip}
-                  </span>
-                  <span className="mt-1.5 block h-1 w-full overflow-hidden rounded-full bg-[#232936]">
-                    <span className={`block h-full rounded-full ${barColor}`} style={{ width: `${score}%` }} />
-                  </span>
-                </span>
-                <span className="text-right">
-                  <span className={`block font-mono text-[13px] font-black tabular-nums ${textColor}`}>{score}%</span>
-                  <span className={`mt-0.5 inline-flex items-center gap-1 font-mono text-[9px] ${failCount > 0 ? 'text-rose-400' : 'text-emerald-400'}`}>
-                    {failCount > 0 ? <ShieldAlert className="h-2.5 w-2.5" /> : <CheckCircle className="h-2.5 w-2.5" />}
-                    {failCount > 0 ? `${failCount} FAIL` : 'COMPLIANT'}
-                  </span>
-                </span>
-              </button>
-            );
-          })}
-        </div>
-      </div>
+      <EndpointRegistryPanel
+        devices={devices}
+        status={endpointSyncStatus}
+        centralData={centralEndpointData}
+        canManage={canManageEndpoints}
+        canDelete={canDeleteEndpoints}
+        lastSyncTime={lastEndpointSync}
+        onSelectDevice={deviceId => {
+          sfx.playClick();
+          onSelectDevice(deviceId);
+        }}
+        onSave={onSaveEndpoint}
+        onDelete={onDeleteEndpoint}
+      />
     </div>
   );
 };

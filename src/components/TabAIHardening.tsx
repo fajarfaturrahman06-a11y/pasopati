@@ -11,8 +11,8 @@ interface TabAIHardeningProps {
   devices: DeviceInfo[];
   selectedDeviceId: string;
   onSelectDevice: (deviceId: string) => void;
-  userApiKey: string;
-  setUserApiKey: (key: string) => void;
+  principalName: string | null;
+  principalRole: string | null;
   geminiKey: string;
   setGeminiKey: (key: string) => void;
   onShowToast: (message: string, type?: 'success' | 'info') => void;
@@ -22,30 +22,31 @@ export const TabAIHardening: React.FC<TabAIHardeningProps> = ({
   devices,
   selectedDeviceId,
   onSelectDevice,
-  userApiKey,
-  setUserApiKey,
+  principalName,
+  principalRole,
   geminiKey,
   setGeminiKey,
   onShowToast
 }) => {
   const currentDevice = devices.find(d => d.id === selectedDeviceId) || devices[0];
-  const failChecks = currentDevice.checks.filter(c => c.status === 'FAIL');
-  const warnChecks = currentDevice.checks.filter(c => c.status === 'WARNING');
-  const deviceScore = calculateDeviceScore(currentDevice.checks);
-
   const [isGeneratingAI, setIsGeneratingAI] = useState(false);
   const [aiAnalysisText, setAiAnalysisText] = useState<string | null>(null);
   const [aiSource, setAiSource] = useState<'gemini' | 'rule-based' | null>(null);
   const [aiModel, setAiModel] = useState<string>('');
   const [opsecActive, setOpsecActive] = useState(true);
   const [verifiedPlan, setVerifiedPlan] = useState<RemediationPlan | null>(null);
+  const currentDeviceId = currentDevice?.id;
 
   useEffect(() => {
     let cancelled = false;
-    listPlans(userApiKey)
+    if (!currentDeviceId) {
+      setVerifiedPlan(null);
+      return () => { cancelled = true; };
+    }
+    listPlans()
       .then(plans => {
         if (cancelled) return;
-        const match = plans.find(p => p.deviceId === currentDevice.id && p.status === 'VERIFIED') || null;
+        const match = plans.find(p => p.deviceId === currentDeviceId && p.status === 'VERIFIED') || null;
         setVerifiedPlan(match);
       })
       .catch(() => {
@@ -54,7 +55,16 @@ export const TabAIHardening: React.FC<TabAIHardeningProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [userApiKey, currentDevice.id]);
+  }, [currentDeviceId]);
+
+  if (!currentDevice) {
+    return <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-8 text-center text-sm text-slate-400">Belum ada endpoint pusat untuk dianalisis. Tambahkan endpoint atau kirim telemetry agen melalui tab Live Agent.</div>;
+  }
+
+  const allChecks = currentDevice.checks || [];
+  const failChecks = allChecks.filter(c => c.status === 'FAIL');
+  const warnChecks = allChecks.filter(c => c.status === 'WARNING');
+  const deviceScore = calculateDeviceScore(allChecks);
 
 
   // Run AI Contextual Risk Analysis
@@ -66,7 +76,8 @@ export const TabAIHardening: React.FC<TabAIHardeningProps> = ({
     try {
       const res = await fetch('/api/analyze-threats', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...(userApiKey.trim() ? { 'X-Pasopati-API-Key': userApiKey.trim() } : {}) },
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           deviceName: currentDevice.name,
           deviceRole: currentDevice.role,
@@ -103,7 +114,7 @@ export const TabAIHardening: React.FC<TabAIHardeningProps> = ({
     <div className="space-y-6">
       
       {/* Title & Device Switcher */}
-      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 bg-[#171b23] p-5 rounded-lg border border-[#2a3140]">
+      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 bg-slate-900/60 p-5 rounded-lg border border-slate-800">
         <div>
           <div className="flex items-center gap-2">
             <h2 className="text-xl font-bold tracking-tight text-rose-400 font-mono">
@@ -135,7 +146,7 @@ export const TabAIHardening: React.FC<TabAIHardeningProps> = ({
                 className={`px-3 py-1.5 rounded-md text-xs font-mono whitespace-nowrap transition-all border flex items-center gap-1.5 ${
                   isSelected
                     ? 'bg-rose-950 text-rose-300 border-rose-600 shadow-[0_0_10px_rgba(239,68,68,0.2)]'
-                    : 'bg-[#171b23] text-slate-400 border-[#2a3140] hover:text-slate-200'
+                    : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-slate-200'
                 }`}
               >
                 <span>{d.name}</span>
@@ -151,7 +162,7 @@ export const TabAIHardening: React.FC<TabAIHardeningProps> = ({
       </div>
 
       {/* Target Device Status Summary Card */}
-      <div className="bg-[#1b202a] border border-[#2a3140] rounded-lg p-5 flex flex-col md:flex-row md:items-center justify-between gap-4">
+      <div className="bg-slate-900/80 border border-slate-800 rounded-lg p-5 flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <div className="flex items-center gap-2">
             <span className="text-lg font-bold font-mono text-slate-100">{currentDevice.name}</span>
@@ -160,7 +171,7 @@ export const TabAIHardening: React.FC<TabAIHardeningProps> = ({
           </div>
           <div className="text-xs font-mono text-slate-400 mt-1 flex items-center gap-3">
             <span>OS: <strong className="text-slate-200">{currentDevice.os}</strong></span>
-            <span>IP: <strong className="text-slate-200">{currentDevice.ip}</strong></span>
+            <span>IP: <strong className="text-sky-400">{currentDevice.ip}</strong></span>
           </div>
         </div>
 
@@ -171,7 +182,7 @@ export const TabAIHardening: React.FC<TabAIHardeningProps> = ({
               <span className="text-rose-400">{failChecks.length} FAIL</span> · <span className="text-amber-400">{warnChecks.length} WARN</span>
             </span>
           </div>
-          <div className="text-right pl-3 border-l border-[#2a3140]">
+          <div className="text-right pl-3 border-l border-slate-800">
             <span className="text-[11px] font-mono text-slate-400 block">Skor Saat Ini</span>
             <span
               className={`text-xl font-bold font-mono tabular-nums ${
@@ -184,39 +195,31 @@ export const TabAIHardening: React.FC<TabAIHardeningProps> = ({
         </div>
       </div>
 
-      {/* API Key Configuration Card */}
-      <div className="bg-[#171b23] border border-[#2a3140] rounded-lg p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+      {/* Session and AI key settings */}
+      <div className="bg-slate-900/60 border border-slate-800 rounded-lg p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div className="flex items-center gap-2">
           <Key className="w-4 h-4 text-rose-400 shrink-0" />
           <div className="text-xs font-mono">
-            <span className="text-slate-300 font-semibold block">Kunci Operasional &amp; AI:</span>
+            <span className="text-slate-300 font-semibold block">Sesi PASOPATI aktif</span>
             <span className="text-slate-500 text-[11px]">
-              <b className="text-rose-400">PASOPATI_API_KEY wajib</b> untuk Buat Plan / Approve / unduh ZIP.
-              Kunci AI opsional; bila kosong dipakai Rule-Based Engine.
+              <b className="text-sky-400">{principalName || 'Operator'} · {principalRole || 'authenticated'}</b> — dashboard memakai cookie sesi; API key/HMAC agen tetap terpisah dari login.
             </span>
           </div>
         </div>
         <div className="w-full sm:w-80 flex flex-col gap-2">
           <input
             type="password"
-            placeholder="1) AI key (opsional) — bukan untuk plan..."
+            placeholder="AI key opsional — bukan API key PASOPATI..."
             value={geminiKey}
             onChange={(e) => setGeminiKey(e.target.value)}
-            className="w-full px-3 py-1.5 text-xs font-mono bg-[#0d1016] border border-[#333b4b] rounded text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-rose-500"
-          />
-          <input
-            type="password"
-            placeholder="2) PASOPATI_API_KEY (wajib untuk plan/approve)..."
-            value={userApiKey}
-            onChange={(e) => setUserApiKey(e.target.value)}
-            className="w-full px-3 py-1.5 text-xs font-mono bg-[#0d1016] border border-[#333b4b] rounded text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-rose-500"
+            className="w-full px-3 py-1.5 text-xs font-mono bg-slate-950 border border-slate-700 rounded text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-rose-500"
           />
           <label className="flex items-center gap-2 cursor-pointer text-[11px] text-slate-400 select-none">
             <input
               type="checkbox"
               checked={opsecActive}
               onChange={(e) => setOpsecActive(e.target.checked)}
-              className="rounded bg-[#0d1016] border-[#333b4b] text-rose-600 focus:ring-0"
+              className="rounded bg-slate-950 border-slate-700 text-rose-600 focus:ring-0"
             />
             <span className="text-rose-400 font-mono">🔒 OPSEC Data Sanitization</span>
           </label>
@@ -232,8 +235,8 @@ export const TabAIHardening: React.FC<TabAIHardeningProps> = ({
       )}
 
       {/* FITUR 1: Analisis Risiko Kontekstual Taktis */}
-      <div className="bg-[#1b202a] border border-[#2a3140] rounded-lg p-5 space-y-4">
-        <div className="flex items-center justify-between border-b border-[#2a3140] pb-3">
+      <div className="bg-slate-900/80 border border-slate-800 rounded-lg p-5 space-y-4">
+        <div className="flex items-center justify-between border-b border-slate-800 pb-3">
           <div className="flex items-center gap-2">
             <AlertOctagon className="w-4 h-4 text-amber-400" />
             <h3 className="text-sm font-bold font-mono text-slate-200 uppercase tracking-wider">
@@ -252,13 +255,13 @@ export const TabAIHardening: React.FC<TabAIHardeningProps> = ({
 
         {/* AI Output Box */}
         {aiAnalysisText ? (
-          <div className="bg-[#0d1016] p-4 rounded-lg border border-[#2a3140] text-xs font-mono space-y-2">
-            <div className="flex items-center justify-between text-[11px] text-slate-400 border-b border-[#2a3140] pb-2">
+          <div className="bg-slate-950 p-4 rounded-lg border border-slate-800 text-xs font-mono space-y-2">
+            <div className="flex items-center justify-between text-[11px] text-slate-400 border-b border-slate-800 pb-2">
               <span className="text-rose-400 flex items-center gap-1.5">
                 <Shield className="w-3.5 h-3.5" />
                 TELAAH INTELIJEN SIBER PASOPATI
               </span>
-              <span className="px-2 py-0.5 rounded bg-[#171b23] text-slate-400 border border-[#2a3140] text-[10px]">
+              <span className="px-2 py-0.5 rounded bg-slate-900 text-slate-400 border border-slate-800 text-[10px]">
                 {aiSource === 'gemini' ? `Model: ${aiModel || 'cloud AI'}` : 'Engine: Rule-Based Defense Baseline'}
               </span>
             </div>
@@ -267,7 +270,7 @@ export const TabAIHardening: React.FC<TabAIHardeningProps> = ({
             </div>
           </div>
         ) : (
-          <div className="p-4 rounded bg-[#0d1016]/60 border border-[#2a3140]/80 text-xs font-mono text-slate-400 flex flex-col items-center justify-center py-6 text-center">
+          <div className="p-4 rounded bg-slate-950/60 border border-slate-800/80 text-xs font-mono text-slate-400 flex flex-col items-center justify-center py-6 text-center">
             <Sparkles className="w-6 h-6 text-rose-400/60 mb-2" />
             <span>Klik tombol <strong>"Generate AI Threat Analysis"</strong> untuk menghasilkan telaah risiko militer dalam Bahasa Indonesia.</span>
           </div>
@@ -275,7 +278,7 @@ export const TabAIHardening: React.FC<TabAIHardeningProps> = ({
       </div>
 
       {/* Panel remediasi: parameter diturunkan dari temuan hardening di atas */}
-      <RemediationPanel currentDevice={currentDevice} apiKey={userApiKey} onShowToast={onShowToast} />
+      <RemediationPanel currentDevice={currentDevice} onShowToast={onShowToast} />
 
     </div>
   );

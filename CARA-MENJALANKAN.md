@@ -16,39 +16,39 @@ agar mudah direview. Beberapa hal wajib dibaca sebelum menjalankan.
 > diganti otomatis.
 
 ## 2. Menyiapkan environment
-
-Arsip ini **menyertakan `.env` berisi kunci hidup**. Ganti/rotasi bila arsip dibagikan lebih luas.
-
+Arsip ini **tidak menyertakan `.env` aktif**. Buat file lokal dari template; jangan commit atau bagikan file `.env` karena berisi kredensial.
 ```bash
-cp .env.example .env   # bila ingin mulai dari template
+cp .env.example .env
 ```
+Isi `.env` lokal:
+- `PASOPATI_ADMIN_USERNAME` dan `PASOPATI_ADMIN_PASSWORD` — akun admin untuk login dashboard; password minimal 12 karakter. Akun dibuat sebagai bootstrap pada pemakaian pertama.
+- `HMAC_SECRET` — min. 32 karakter acak untuk tanda tangan telemetri/evidence agen.
+- `PASOPATI_API_KEY` — min. 32 karakter acak untuk kompatibilitas integrasi API/agen; **bukan** kredensial login dashboard.
+- `GEMINI_API_KEY` / `GEMINI_BASE_URL` / `AI_MODEL_NAME` — opsional; tanpa ini AI memakai rule-based.
 
-Isi minimum:
-
-- `PASOPATI_API_KEY` — min. 32 karakter acak (header `X-Pasopati-API-Key`)
-- `HMAC_SECRET` — min. 32 karakter acak (tanda tangan telemetri & evidence)
-- `GEMINI_API_KEY` / `GEMINI_BASE_URL` / `AI_MODEL_NAME` — opsional; tanpa ini AI memakai rule-based
-
-Nilai acak bisa dibuat dengan:
-
-```bash
-openssl rand -hex 32
-```
+Buat nilai acak, misalnya dengan `openssl rand -hex 32`, lalu simpan hanya di `.env` lokal. Jangan mengisi username/password sungguhan ke `.env.example` atau arsip source. Akun bootstrap admin tidak dibuat bila dua variabel `PASOPATI_ADMIN_*` kosong; endpoint login akan menjelaskan bahwa konfigurasi perlu dilengkapi.
 
 ## 3. Menjalankan Command Center
-
 ```bash
 npm install
 npm run dev
 ```
-
 Buka `http://localhost:3000`.
+### Login dan tes admin vs user biasa
+1. Masuk dengan `PASOPATI_ADMIN_USERNAME` dan `PASOPATI_ADMIN_PASSWORD` yang dikonfigurasi di `.env` sebelum server pertama kali dijalankan.
+2. Di sidebar admin pilih **BUAT USER UJI**. Tentukan username serta password minimal 12 karakter untuk akun `viewer`.
+3. Catat kredensial viewer yang ditampilkan, lalu tutup panel dan pilih **KELUAR**.
+4. Masuk dengan akun viewer. Viewer hanya memiliki izin baca; permintaan yang membutuhkan role admin ditolak backend.
+5. Untuk kembali, keluar lalu masuk menggunakan akun admin.
 
-Produksi:
+Password disimpan sebagai hash scrypt di `data/auth.sqlite`. Browser menerima cookie sesi `HttpOnly`, `SameSite=Lax` yang kedaluwarsa setelah 12 jam; password dan token sesi tidak disimpan di `localStorage`. API key/HMAC tetap digunakan oleh integrasi agen/backend lama, bukan sebagai login UI. Pengaturan env bootstrap hanya membuat akun saat pertama kali; mengubah env setelahnya tidak otomatis mengganti akun yang sudah tersimpan.
 
+Untuk production, cookie sesi ditandai `Secure`; akses dashboard wajib melalui HTTPS. Pengujian laptop dengan `npm run dev` dapat memakai HTTP localhost.
+
+Build dan test:
 ```bash
 npm run build
-npm start
+npm test
 ```
 
 ## 4. Menjalankan Field Console (opsional)
@@ -64,8 +64,12 @@ PASOPATI_DOWNLOAD_PASSWORD='<password>' python3 -m streamlit run app.py
 npm test
 ```
 
+Berjalan di Linux, WSL, dan Windows (Python dipilih otomatis; `bash -n` lewat stdin;
+2 uji berbasis chmod di-skip di Windows; `test:elevation` SKIP tanpa `unshare`).
+
 Mencakup lint/ESLint, smoke kontrol plane, expiry token, unit agent + SSH/UFW,
-cakupan skrip, generator app.py, redaksi OPSEC, dan elevasi nyata.
+cakupan skrip, generator app.py, redaksi OPSEC, elevasi nyata, serta auth smoke
+untuk login username/password, cookie sesi, RBAC admin/viewer, dan logout.
 
 ## 6. Uji di laptop Windows
 
@@ -88,12 +92,13 @@ Ikuti `docs/WINDOWS-TEST-PLAYBOOK.md`. Ringkas:
 
 ## 8. Batasan yang masih terbuka
 
-TLS/mTLS, RBAC multi-operator, database transaksional, antrean per host, dan
-penandatanganan artefak agent belum diimplementasikan. Lihat `docs/AUDIT-2026-11-13.md`
+TLS/mTLS, database transaksional, antrean per host, dan penandatanganan artefak
+agent belum diimplementasikan. RBAC operator berbasis API key tersedia; gunakan
+HTTPS saat mengakses dari jaringan selain loopback. Lihat `docs/AUDIT-2026-11-13.md`
 dan `docs/RESEARCH-LOG-2026-11-12.md` §8.
 
 ## 9. Keamanan arsip
 
-- `.env`, `opencode.json`, `reapprove.ps1`, `token.txt`, dan `bitlocker-recovery-NIKO.txt` **disertakan**.
-- Rotasi `PASOPATI_API_KEY`, `HMAC_SECRET`, dan `GEMINI_API_KEY` setelah review selesai.
-- Jangan unggah arsip ini ke repositori publik tanpa mengganti kunci.
+- `.env` dibuat lokal dari `.env.example` dan tidak dimasukkan ke arsip source ini.
+- Rotasi `PASOPATI_API_KEY`, `HMAC_SECRET`, atau `GEMINI_API_KEY` jika pernah dibagikan di luar lingkungan uji.
+- Jangan unggah file `.env` atau kredensial ke repositori publik.

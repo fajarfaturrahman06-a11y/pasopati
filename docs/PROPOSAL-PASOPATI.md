@@ -166,7 +166,7 @@ Pemeriksaan `/proc/version` untuk mendeteksi string "microsoft" / "wsl" mencegah
 
 ### 3.1 Tahapan Penelitian
 
-> **Status:** Fase A–E **selesai 06 Nov 2026** (pilot WSL: 2 VERIFIED + 1 ROLLED_BACK benar). Operasional + hardening repo (rotasi secret, purge `TACTICAL_SECRET_2026` dari riwayat) selesai. Lihat `CHECKPOINT.md`.
+> **Status:** Fase A-E **selesai 06 Nov 2026** (pilot WSL: 2 VERIFIED + 1 ROLLED_BACK benar). Operasional + hardening repo (rotasi secret, purge secret legacy dari riwayat) selesai. Lihat `CHECKPOINT.md`.
 
 Penelitian ini mengikuti roadmap lima fase:
 
@@ -397,7 +397,7 @@ PASOPATI berhasil menyediakan (1) audit kepatuhan read-only yang deterministik, 
 ### 5.2 Saran
 
 1. **Pilot baremetal:** Windows + BitLocker (TPM aktif, admin PowerShell, simpan recovery key offline, reboot), Linux + auditd (kernel audit aktif), LUKS manual (snapshot VM → `cryptsetup luksFormat` → `crypttab` → reboot → verifikasi `crypto_LUKS`). Jangan coba di host produksi tanpa snapshot.
-2. **Keamanan operasional:** rotasi `HMAC_SECRET`/`PASOPATI_API_KEY` berkala (hanya di `.env`, tidak dilacak git). Secret lama `TACTICAL_SECRET_2026` **sudah dipurge dari riwayat via `git filter-repo` 06 Nov 2026** (terverifikasi `git log -S` kosong); anggap bocor, jangan dipakai.
+2. **Keamanan operasional:** rotasi `HMAC_SECRET`/`PASOPATI_API_KEY` berkala (hanya di `.env`, tidak dilacak git). Secret legacy **sudah dipurge dari riwayat via `git filter-repo` 06 Nov 2026** (terverifikasi `git log -S` kosong); anggap bocor, jangan dipakai.
 3. **Perluasan alias:** `LUKS` dan `sudoers` (memerlukan reboot/manual yang jelas) serta BitLocker di baremetal dengan pengelolaan recovery key yang eksplisit.
 4. **Fase lanjutan (Fase F yang diusulkan):** four-eyes approval untuk item HIGH risk, scheduling terjadwal, dan ekspor evidence terverifikasi independen via HMAC untuk audit eksternal.
 5. **Submission:** lengkapi link publik, thumbnail 1200×630, screenshot, video YouTube ≤10 menit, dan slide penjelasan sebelum deadline 15 November 2026.

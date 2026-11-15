@@ -1,0 +1,13 @@
+# Normalisasi akhir baris: LF di repo, sesuai platform saat checkout.
+* text=auto eol=lf
+
+# Biner
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.zip binary
+
+# Skrip yang dieksekusi di Linux/WSL harus tetap LF.
+*.sh text eol=lf
+*.py text eol=lf

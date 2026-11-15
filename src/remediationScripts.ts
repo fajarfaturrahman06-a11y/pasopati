@@ -99,7 +99,7 @@ Write-Host "[*] Baseline perangkat ${safeName} telah patuh standar pertahanan." 
         "done",
         "if [ \"$DRY_RUN\" = true ]; then echo '[!] MODE DRY-RUN: evaluasi tanpa mengubah sistem.'; fi",
         "",
-        "STATE_DIR=\"/var/lib/pasopati-guard/state\"",
+        "STATE_DIR=\"/var/lib/pasopati/state\"",
         "if [ \"$DRY_RUN\" = false ]; then mkdir -p \"$STATE_DIR\"; fi",
         "say() { echo \"[*] $*\"; }",
         "run() { if [ \"$DRY_RUN\" = false ]; then \"$@\"; else echo \"    [DRY-RUN] $*\"; fi; }",
@@ -117,7 +117,7 @@ Write-Host "[*] Baseline perangkat ${safeName} telah patuh standar pertahanan." 
         "#!/bin/bash",
         "# ==============================================================================",
         `# PASOPATI DETERMINISTIC ROLLBACK ENGINE v2.6: ${safeName}`,
-        `# Memulihkan pre-state yang disimpan di /var/lib/pasopati-guard/state`,
+        `# Memulihkan pre-state yang disimpan di /var/lib/pasopati/state`,
         `# Generated: ${nowStr}`,
         "# ==============================================================================",
         "set -u",
@@ -127,7 +127,7 @@ Write-Host "[*] Baseline perangkat ${safeName} telah patuh standar pertahanan." 
         "  if command -v pkexec >/dev/null 2>&1; then exec pkexec env PASOPATI_ELEVATED=1 bash \"$0\" \"$@\"; fi",
         "  echo '[!] Butuh root. Jalankan: sudo bash \"$0\"' >&2; exit 1",
         "fi",
-        "STATE_DIR=\"/var/lib/pasopati-guard/state\"",
+        "STATE_DIR=\"/var/lib/pasopati/state\"",
         `say() { echo "[*] $*"; }`,
         `say "Menjalankan rollback pada ${safeName}..."`,
         ""
@@ -403,9 +403,21 @@ Write-Host "[*] Baseline perangkat ${safeName} telah patuh standar pertahanan." 
       { port: 4444, label: 'Backdoor C2 Port 4444' },
       { port: 445, label: 'SMB Port 445' },
       { port: 23, label: 'Telnet Port 23' },
-      { port: 21, label: 'FTP Port 21' }
+      { port: 21, label: 'FTP Port 21' },
+      // Agent memblokir 3389 juga (_WIN_CRIT_PORTS). Wajib tampil di runbook yang
+      // ditinjau operator, karena ini memutus akses remote.
+      { port: 3389, label: 'RDP Port 3389 (AKSES REMOTE TERPUTUS)' }
     ];
     if (include('ports-block-windows')) markAll(/dangerous port|network & dangerous/);
+    const rdpMentioned = allFindings.some(c => /rdp|nla|3389/.test(hay(c)));
+    if (include('ports-block-windows') && (ports.includes(3389) || rdpMentioned)) {
+      hLines.push("# ==============================================================================");
+      hLines.push("# [PERINGATAN AKSES] Langkah ini memblokir RDP 3389 (inbound).");
+      hLines.push("# Sesi RDP BARU tidak bisa masuk sampai rule PASOPATI-Block-3389 dihapus.");
+      hLines.push("# Sediakan konsol/IPMI/KVM, atau siapkan rollback sebelum menutup sesi ini.");
+      hLines.push("# ==============================================================================");
+      hLines.push("");
+    }
     for (const d of portsWin) {
       if (!include('ports-block-windows')) break;
       const foundInText = markAll(new RegExp(String(d.port)));

@@ -4,19 +4,17 @@ import { sfx } from '../utils/audio';
 import { Download, Upload, Terminal, CheckCircle2, AlertCircle, FileCode, Server } from 'lucide-react';
 
 interface TabLiveAgentProps {
-  onAddUploadedDevice: (device: DeviceInfo) => void;
+  onAddUploadedDevice: (device: DeviceInfo, source?: 'agent' | 'demo') => Promise<void>;
   onNavigateToAudit: (deviceId: string) => void;
   onDownloadFile?: (fileName: string, downloadUrl: string) => void;
   onRequestSecureDownload?: (fileName: string, downloadUrl: string) => void;
-  apiKey?: string;
 }
 
 export const TabLiveAgent: React.FC<TabLiveAgentProps> = ({
   onAddUploadedDevice,
   onNavigateToAudit,
   onDownloadFile,
-  onRequestSecureDownload,
-  apiKey
+  onRequestSecureDownload
 }) => {
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [uploadedResult, setUploadedResult] = useState<AuditAgentResult | null>(null);
@@ -30,12 +28,13 @@ export const TabLiveAgent: React.FC<TabLiveAgentProps> = ({
     try {
       const res = await fetch('/api/scan-host', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...(apiKey ? { 'X-Pasopati-API-Key': apiKey } : {}) },
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ unitName: 'PASOPATI-LIVE-RUNTIME-NODE' })
       });
       if (!res.ok) throw new Error('Gagal mengeksekusi pemindaian mesin host.');
       const json = await res.json();
-      processAuditData(json);
+      await processAuditData(json);
     } catch (err: any) {
       setUploadError(err.message || 'Gagal memindai mesin server.');
     } finally {
@@ -101,7 +100,7 @@ export const TabLiveAgent: React.FC<TabLiveAgentProps> = ({
           throw new Error('Format JSON tidak sesuai dengan skema PASOPATI Agent.');
         }
 
-        processAuditData(json);
+        void processAuditData(json).catch((err: any) => setUploadError(err?.message || 'Gagal menyimpan endpoint ke VPS.'));
       } catch (err: any) {
         setUploadError(err.message || 'Gagal memproses file JSON.');
       }
@@ -110,7 +109,7 @@ export const TabLiveAgent: React.FC<TabLiveAgentProps> = ({
   };
 
   // Process and ingest into session devices
-  const processAuditData = (json: AuditAgentResult) => {
+  const processAuditData = async (json: AuditAgentResult, source: 'agent' | 'demo' = 'agent') => {
     setUploadedResult(json);
     const rawUnitName = String(json.metadata?.tactical_unit || 'UPLOADED-JURI-NODE');
     const unitName = /^[A-Z0-9][A-Z0-9-_]{0,31}$/.test(rawUnitName.toUpperCase()) ? rawUnitName.toUpperCase() : 'UPLOADED-JURI-NODE';
@@ -120,6 +119,7 @@ export const TabLiveAgent: React.FC<TabLiveAgentProps> = ({
 
     const newDevice: DeviceInfo = {
       id: unitName,
+      agentId: unitName,
       name: unitName,
       hostname: String(deviceInfo.hostname || 'Unknown Host'),
       role: 'Perangkat Uji Nyata (Hasil Scan CLI Agent)',
@@ -144,7 +144,7 @@ export const TabLiveAgent: React.FC<TabLiveAgentProps> = ({
       })
     };
 
-    onAddUploadedDevice(newDevice);
+    await onAddUploadedDevice(newDevice, source);
     sfx.playSuccess();
   };
 
@@ -215,14 +215,14 @@ export const TabLiveAgent: React.FC<TabLiveAgentProps> = ({
       ]
     };
 
-    processAuditData(sample);
+    void processAuditData(sample, 'demo').catch((err: any) => setUploadError(err?.message || 'Gagal memuat contoh demo.'));
   };
 
   return (
     <div className="space-y-6">
       
       {/* Title */}
-      <div className="bg-[#171b23] p-5 rounded-lg border border-[#2a3140]">
+      <div className="bg-slate-900/60 p-5 rounded-lg border border-slate-800">
         <h2 className="text-xl font-bold tracking-tight text-rose-400 font-mono">
           LIVE AGENT SCANNER & CUSTOM JSON INGESTION
         </h2>
@@ -234,9 +234,9 @@ export const TabLiveAgent: React.FC<TabLiveAgentProps> = ({
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         
         {/* Left Column: Download CLI Agent & Run Instructions */}
-        <div className="lg:col-span-6 bg-[#1b202a] border border-[#2a3140] rounded-lg p-5 flex flex-col justify-between space-y-4">
+        <div className="lg:col-span-6 bg-slate-900/80 border border-slate-800 rounded-lg p-5 flex flex-col justify-between space-y-4">
           <div>
-            <div className="flex items-center gap-2 border-b border-[#2a3140] pb-3 mb-4">
+            <div className="flex items-center gap-2 border-b border-slate-800 pb-3 mb-4">
               <Terminal className="w-5 h-5 text-rose-400" />
               <h3 className="text-sm font-bold font-mono text-slate-100 uppercase tracking-wider">
                 1. Unduh Script Pemeriksaan (`pasopati_audit.py`)
@@ -260,7 +260,7 @@ export const TabLiveAgent: React.FC<TabLiveAgentProps> = ({
               <span className="text-xs font-mono text-slate-400 block font-semibold">
                 Panduan Menjalankan di Terminal Dewan Juri:
               </span>
-              <div className="bg-[#0d1016] p-3 rounded border border-[#2a3140] font-mono text-[11px] text-rose-400/90 space-y-2">
+              <div className="bg-slate-950 p-3 rounded border border-slate-800 font-mono text-[11px] text-rose-400/90 space-y-2">
                 <div>
                   <span className="text-slate-500"># 1. Jalankan audit lokal di Linux/Windows:</span>
                   <div className="text-slate-200">python pasopati_audit.py -u "LAPTOP-JURI-TEST"</div>
@@ -274,7 +274,7 @@ export const TabLiveAgent: React.FC<TabLiveAgentProps> = ({
           </div>
 
           {/* Repository Packages Downloader */}
-          <div className="pt-4 border-t border-[#2a3140] space-y-3">
+          <div className="pt-4 border-t border-slate-800 space-y-3">
             <div className="p-3 rounded-lg bg-rose-950/40 border border-rose-600/40 flex items-center justify-between gap-3">
               <div>
                 <div className="text-xs font-bold font-mono text-rose-300">
@@ -303,21 +303,21 @@ export const TabLiveAgent: React.FC<TabLiveAgentProps> = ({
               <div className="grid grid-cols-3 gap-2">
                 <button
                   onClick={handleDownloadApp}
-                  className="px-2 py-1.5 rounded bg-[#0d1016] hover:bg-[#171b23] border border-[#2a3140] text-slate-300 hover:text-rose-400 text-[11px] font-mono flex items-center justify-center gap-1.5 transition-colors"
+                  className="px-2 py-1.5 rounded bg-slate-950 hover:bg-slate-900 border border-slate-800 text-slate-300 hover:text-rose-400 text-[11px] font-mono flex items-center justify-center gap-1.5 transition-colors"
                 >
                   <FileCode className="w-3.5 h-3.5 text-rose-400" />
                   <span>app.py</span>
                 </button>
                 <button
                   onClick={handleDownloadRequirements}
-                  className="px-2 py-1.5 rounded bg-[#0d1016] hover:bg-[#171b23] border border-[#2a3140] text-slate-300 hover:text-rose-400 text-[11px] font-mono flex items-center justify-center gap-1.5 transition-colors"
+                  className="px-2 py-1.5 rounded bg-slate-950 hover:bg-slate-900 border border-slate-800 text-slate-300 hover:text-rose-400 text-[11px] font-mono flex items-center justify-center gap-1.5 transition-colors"
                 >
                   <FileCode className="w-3.5 h-3.5 text-rose-400" />
                   <span>requirements.txt</span>
                 </button>
                 <button
                   onClick={handleDownloadReadme}
-                  className="px-2 py-1.5 rounded bg-[#0d1016] hover:bg-[#171b23] border border-[#2a3140] text-slate-300 hover:text-rose-400 text-[11px] font-mono flex items-center justify-center gap-1.5 transition-colors"
+                  className="px-2 py-1.5 rounded bg-slate-950 hover:bg-slate-900 border border-slate-800 text-slate-300 hover:text-rose-400 text-[11px] font-mono flex items-center justify-center gap-1.5 transition-colors"
                 >
                   <FileCode className="w-3.5 h-3.5 text-rose-400" />
                   <span>README.md</span>
@@ -328,10 +328,10 @@ export const TabLiveAgent: React.FC<TabLiveAgentProps> = ({
         </div>
 
         {/* Right Column: Upload JSON or 1-Click Sample Preloader */}
-        <div className="lg:col-span-6 bg-[#1b202a] border border-[#2a3140] rounded-lg p-5 flex flex-col justify-between space-y-4">
+        <div className="lg:col-span-6 bg-slate-900/80 border border-slate-800 rounded-lg p-5 flex flex-col justify-between space-y-4">
           <div>
-            <div className="flex items-center gap-2 border-b border-[#2a3140] pb-3 mb-4">
-              <Upload className="w-5 h-5 text-rose-400" />
+            <div className="flex items-center gap-2 border-b border-slate-800 pb-3 mb-4">
+              <Upload className="w-5 h-5 text-sky-400" />
               <h3 className="text-sm font-bold font-mono text-slate-100 uppercase tracking-wider">
                 2. Unggah File `audit_result.json`
               </h3>
@@ -342,7 +342,7 @@ export const TabLiveAgent: React.FC<TabLiveAgentProps> = ({
             </p>
 
             {/* File Dropzone */}
-            <label className="border-2 border-dashed border-[#333b4b] hover:border-rose-500 rounded-lg p-6 flex flex-col items-center justify-center cursor-pointer transition-colors bg-[#0d1016]/50">
+            <label className="border-2 border-dashed border-slate-700 hover:border-rose-500 rounded-lg p-6 flex flex-col items-center justify-center cursor-pointer transition-colors bg-slate-950/50">
               <Upload className="w-8 h-8 text-slate-500 mb-2" />
               <span className="text-xs font-mono text-slate-300 font-semibold">
                 Klik untuk memilih file audit_result.json
@@ -390,7 +390,7 @@ export const TabLiveAgent: React.FC<TabLiveAgentProps> = ({
             </div>
 
             {/* Quick 1-Click Sample Load Button */}
-            <div className="mt-4 pt-4 border-t border-[#2a3140]">
+            <div className="mt-4 pt-4 border-t border-slate-800">
               <span className="text-[11px] font-mono text-slate-400 block mb-2 font-semibold">
                 Opsi Simulasi Laptop Dewan Juri:
               </span>

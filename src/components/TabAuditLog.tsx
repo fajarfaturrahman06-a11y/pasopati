@@ -17,27 +17,25 @@ interface TabAuditLogProps {
   logs: AuditLogEntry[];
   onLogsUpdated: (updatedLogs: AuditLogEntry[]) => void;
   onShowToast: (message: string, type?: 'success' | 'info') => void;
-  apiKey: string;
 }
 
 const AUDIT_DB_PATH = 'data/audit_logs.json';
 
-function auditHeaders(apiKey: string): Record<string, string> {
-  const k = (apiKey || '').trim();
-  return k ? { 'Content-Type': 'application/json', 'X-Pasopati-API-Key': k } : { 'Content-Type': 'application/json' };
+function auditHeaders(): Record<string, string> {
+  return { 'Content-Type': 'application/json' };
 }
 
 export const TabAuditLog: React.FC<TabAuditLogProps> = ({
   logs,
   onLogsUpdated,
-  onShowToast,
-  apiKey
+  onShowToast
 }) => {
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [filterAction, setFilterAction] = useState<string>('ALL');
   const [isLoading, setIsLoading] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isClearing, setIsClearing] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
 
   const storedCount = logs.filter((l) => l.storedInDb).length;
   const pendingCount = logs.length - storedCount;
@@ -45,7 +43,7 @@ export const TabAuditLog: React.FC<TabAuditLogProps> = ({
   const handleLoadFromDb = async () => {
     setIsLoading(true);
     try {
-      const res = await fetch('/api/audit-logs', { headers: auditHeaders(apiKey) });
+      const res = await fetch('/api/audit-logs' + (showArchived ? '?includeDeleted=1' : ''), { credentials: 'same-origin', headers: auditHeaders() });
       const data = await res.json().catch(() => null);
       if (!res.ok) throw new Error(data?.reason || `HTTP ${res.status}`);
       const loaded = Array.isArray(data?.logs) ? data.logs : [];
@@ -64,10 +62,13 @@ export const TabAuditLog: React.FC<TabAuditLogProps> = ({
           changesSummary: String(l.changesSummary || ''),
           changesDetails: Array.isArray(l.changesDetails) ? l.changesDetails.filter((x: any) => typeof x === 'string').map((x: any) => String(x)) : [],
           status: (['SUCCESS', 'WARNING', 'FAILED'].includes(String(l.status)) ? String(l.status) : 'SUCCESS') as AuditLogEntry['status'],
-          storedInDb: true
+          storedInDb: true,
+          ...(typeof l.deletedAt === 'string' ? { deletedAt: l.deletedAt } : {})
         }));
       onLogsUpdated(mapped);
-      onShowToast(`Riwayat audit dimuat dari database lokal (${mapped.length} entri).`);
+      onShowToast(
+        `Riwayat audit dimuat dari database lokal (${mapped.length} entri${showArchived ? ', termasuk arsip' : ''}).`
+      );
     } catch (err: any) {
       onShowToast(`Gagal memuat dari database lokal: ${err?.message || ''}`, 'info');
     } finally {
@@ -80,7 +81,8 @@ export const TabAuditLog: React.FC<TabAuditLogProps> = ({
     try {
       const res = await fetch('/api/audit-logs', {
         method: 'POST',
-        headers: auditHeaders(apiKey),
+        credentials: 'same-origin',
+        headers: auditHeaders(),
         body: JSON.stringify({ logs })
       });
       const data = await res.json().catch(() => null);
@@ -107,13 +109,13 @@ export const TabAuditLog: React.FC<TabAuditLogProps> = ({
   };
 
   const handleClearDb = async () => {
-    if (!window.confirm('Kosongkan seluruh database audit lokal? Tindakan ini tidak dapat dibatalkan.')) return;
+    if (!window.confirm('Arsipkan (soft delete) seluruh database audit lokal? Entri tidak dihapus permanen; rantai hash tetap utuh.')) return;
     setIsClearing(true);
     try {
-      const res = await fetch('/api/audit-logs', { method: 'DELETE', headers: auditHeaders(apiKey) });
+      const res = await fetch('/api/audit-logs', { method: 'DELETE', credentials: 'same-origin', headers: auditHeaders() });
       if (res.ok) {
         onLogsUpdated([]);
-        onShowToast('Database audit lokal telah dikosongkan.');
+        onShowToast('Entri audit diarsipkan. Aktifkan "arsip" lalu Muat dari DB untuk melihatnya.');
       } else {
         onShowToast('Gagal membersihkan database lokal.', 'info');
       }
@@ -140,8 +142,8 @@ export const TabAuditLog: React.FC<TabAuditLogProps> = ({
 
   return (
     <div className="space-y-6">
-      <div className="p-5 rounded-lg bg-[#1b202a] border border-[#2a3140] shadow-xl relative overflow-hidden">
-        <div className="absolute top-0 right-0 w-80 h-32 bg-rose-500/5 blur-3xl pointer-events-none" />
+      <div className="p-5 rounded-lg bg-[#090e18] border border-slate-800 shadow-xl relative overflow-hidden">
+        <div className="absolute top-0 right-0 w-80 h-32 bg-sky-500/5 blur-3xl pointer-events-none" />
 
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div className="flex items-start gap-3.5">
@@ -166,9 +168,21 @@ export const TabAuditLog: React.FC<TabAuditLogProps> = ({
 
           <div className="flex flex-wrap items-center gap-2 shrink-0">
             <button
+              onClick={() => setShowArchived(v => !v)}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-mono font-bold border transition-all ${
+                showArchived
+                  ? 'bg-amber-950/70 text-amber-300 border-amber-700'
+                  : 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700'
+              }`}
+              title="Sertakan entri yang sudah diarsipkan (soft delete)"
+            >
+              arsip {showArchived ? 'ON' : 'OFF'}
+            </button>
+
+            <button
               onClick={handleLoadFromDb}
               disabled={isLoading}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-mono font-bold bg-[#232936] hover:bg-slate-700 text-slate-100 border border-[#333b4b] transition-all disabled:opacity-50"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-mono font-bold bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-700 transition-all disabled:opacity-50"
               title="Muat riwayat audit dari database lokal"
             >
               <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`} />
@@ -188,7 +202,7 @@ export const TabAuditLog: React.FC<TabAuditLogProps> = ({
             <button
               onClick={handleClearDb}
               disabled={isClearing || logs.length === 0}
-              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-mono text-slate-300 bg-[#171b23] hover:bg-[#232936] border border-[#333b4b] transition-colors disabled:opacity-50"
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-mono text-slate-300 bg-slate-900 hover:bg-slate-800 border border-slate-700 transition-colors disabled:opacity-50"
               title="Kosongkan database audit lokal"
             >
               <Trash2 className="w-3.5 h-3.5" />
@@ -197,13 +211,13 @@ export const TabAuditLog: React.FC<TabAuditLogProps> = ({
           </div>
         </div>
 
-        <div className="mt-4 pt-3 border-t border-[#2a3140]/80 flex flex-wrap items-center justify-between gap-3 text-xs font-mono">
+        <div className="mt-4 pt-3 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-xs font-mono">
           <div className="flex items-center gap-4 text-slate-400">
             <span>TOTAL AKTIVITAS: <strong className="text-slate-200">{logs.length}</strong></span>
             <span>TERSIMPAN DI DB: <strong className="text-emerald-400">{storedCount}</strong></span>
             <span>BELUM DISIMPAN: <strong className={pendingCount > 0 ? 'text-amber-400' : 'text-emerald-400'}>{pendingCount}</strong></span>
             <span className="text-slate-500 truncate max-w-xs" title={AUDIT_DB_PATH}>
-              DB: <strong className="text-rose-300">{AUDIT_DB_PATH}</strong>
+              DB: <strong className="text-sky-400">{AUDIT_DB_PATH}</strong>
             </span>
           </div>
           <span className="text-[11px] text-slate-500">
@@ -221,21 +235,21 @@ export const TabAuditLog: React.FC<TabAuditLogProps> = ({
               placeholder="Cari perangkat / aksi / perub..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full pl-8 pr-3 py-1.5 text-xs font-mono bg-[#1b202a] border border-[#2a3140] rounded-md text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-rose-500"
+              className="w-full pl-8 pr-3 py-1.5 text-xs font-mono bg-[#090e18] border border-slate-800 rounded-md text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-sky-500"
             />
           </div>
 
-          <div className="flex items-center gap-1.5 bg-[#1b202a] border border-[#2a3140] rounded-md px-2 py-1">
+          <div className="flex items-center gap-1.5 bg-[#090e18] border border-slate-800 rounded-md px-2 py-1">
             <Filter className="w-3 h-3 text-slate-500" />
             <select
               value={filterAction}
               onChange={(e) => setFilterAction(e.target.value)}
               className="bg-transparent text-xs font-mono text-slate-300 focus:outline-none cursor-pointer"
             >
-              <option value="ALL" className="bg-[#1b202a]">SEMUA AKSI</option>
-              <option value="HARDENING" className="bg-[#1b202a]">HARDENING</option>
-              <option value="ROLLBACK" className="bg-[#1b202a]">ROLLBACK</option>
-              <option value="TELEMETRY" className="bg-[#1b202a]">TELEMETRI INGEST</option>
+              <option value="ALL" className="bg-[#090e18]">SEMUA AKSI</option>
+              <option value="HARDENING" className="bg-[#090e18]">HARDENING</option>
+              <option value="ROLLBACK" className="bg-[#090e18]">ROLLBACK</option>
+              <option value="TELEMETRY" className="bg-[#090e18]">TELEMETRI INGEST</option>
             </select>
           </div>
         </div>
@@ -247,7 +261,7 @@ export const TabAuditLog: React.FC<TabAuditLogProps> = ({
       </div>
 
       {filteredLogs.length === 0 ? (
-        <div className="p-12 text-center rounded-lg bg-[#1b202a] border border-[#2a3140] space-y-3">
+        <div className="p-12 text-center rounded-lg bg-[#090e18] border border-slate-800 space-y-3">
           <History className="w-10 h-10 text-slate-600 mx-auto" />
           <div className="text-sm font-mono font-bold text-slate-300">
             BELUM ADA RIWAYAT AKSI REMEDIATOR
@@ -257,10 +271,10 @@ export const TabAuditLog: React.FC<TabAuditLogProps> = ({
           </p>
         </div>
       ) : (
-        <div className="rounded-lg border border-[#2a3140] bg-[#1b202a] overflow-hidden shadow-xl">
+        <div className="rounded-lg border border-slate-800 bg-[#090e18] overflow-hidden shadow-xl">
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs font-mono">
-              <thead className="bg-[#171b23] border-b border-[#2a3140] text-slate-400 uppercase tracking-wider text-[11px]">
+              <thead className="bg-[#0c1322] border-b border-slate-800 text-slate-400 uppercase tracking-wider text-[11px]">
                 <tr>
                   <th className="py-3 px-4">WAKTU (UTC)</th>
                   <th className="py-3 px-4">TARGET PERANGKAT</th>
@@ -271,14 +285,14 @@ export const TabAuditLog: React.FC<TabAuditLogProps> = ({
                   <th className="py-3 px-4 text-center">PENYIMPANAN</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-[#2a3140]/80">
+              <tbody className="divide-y divide-slate-800/80">
                 {filteredLogs.map(log => {
                   const isHardening = log.action.includes('HARDENING');
                   const isRollback = log.action.includes('ROLLBACK');
                   const scoreDiff = log.postScore - log.preScore;
 
                   return (
-                    <tr key={log.id} className="hover:bg-[#171b23]/50 transition-colors">
+                    <tr key={log.id} className="hover:bg-slate-900/50 transition-colors">
                       <td className="py-3 px-4 text-slate-400 whitespace-nowrap">
                         {log.timestamp}
                       </td>

@@ -1,0 +1,19 @@
+[Unit]
+Description=PASOPATI remediation agent (watch mode)
+Documentation=https://localhost/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Isi: PASOPATI_SERVER, PASOPATI_HOST_KEY, PASOPATI_API_KEY, HMAC_SECRET
+EnvironmentFile=/etc/pasopati/agent.env
+ExecStart=/usr/bin/python3 /opt/pasopati/pasopati_remediate.py --watch --server ${PASOPATI_SERVER} --interval 60
+Restart=always
+RestartSec=15
+# Agent butuh root untuk iptables/sshd/sudoers.
+User=root
+WorkingDirectory=/opt/pasopati
+
+[Install]
+WantedBy=multi-user.target

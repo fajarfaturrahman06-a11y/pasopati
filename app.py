@@ -3,6 +3,12 @@
  PASOPATI: System Audit, Threat Remediation & Intelligence Architecture Guard
  Defense Cyber Operations & Core Infrastructure Hardening Console
  Platform: Streamlit + Plotly + Google Gemini AI Engine + ISA/IEC 62443 + DISA STIG
+
+ STATUS: DEPRECATED untuk operasi nyata.
+ - Field Console ini bekerja pada data contoh/unggahan; TIDAK memanggil agent dan
+   logika remediasinya terpisah dari allowlist agent (rawan menyimpang).
+ - Untuk aset nyata gunakan Command Center (React+Express) + `pasopati_audit.py`
+   dan `pasopati_remediate.py`. Console ini dipertahankan untuk demo luring.
 ================================================================================
 """
 

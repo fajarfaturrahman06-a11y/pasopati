@@ -13,6 +13,7 @@ import re
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -27,12 +28,30 @@ class RollbackTests(unittest.TestCase):
         self.orig_paths = (list(agent._GRUB_PATHS), agent._SSHD_CONFIG_PATH, agent._USB_MODPROBE_PATH)
         self.orig_suid = list(agent._SUID_CANDIDATES)
         self.orig_sudoers_files = agent._sudoers_files
+        self.orig_backup_dir = agent._remediation_backup_dir
+        self.orig_read_text = agent._read_text
+        self.orig_allowlist = dict(agent.ALLOWLIST_ANALISA)
+        self.orig_validate = agent._validate_remediation_token
+        self.orig_elevated = agent._is_elevated
+        self.orig_history = agent.append_history
+        self.orig_audit = agent.run_full_audit
+        self.orig_push = agent._push_remediation_evidence
+        agent._remediation_backup_dir = lambda: self.tmp
 
     def tearDown(self):
         agent._run_no_shell = self.orig_run
         agent._GRUB_PATHS, agent._SSHD_CONFIG_PATH, agent._USB_MODPROBE_PATH = self.orig_paths
         agent._SUID_CANDIDATES = self.orig_suid
         agent._sudoers_files = self.orig_sudoers_files
+        agent._remediation_backup_dir = self.orig_backup_dir
+        agent._read_text = self.orig_read_text
+        agent.ALLOWLIST_ANALISA.clear()
+        agent.ALLOWLIST_ANALISA.update(self.orig_allowlist)
+        agent._validate_remediation_token = self.orig_validate
+        agent._is_elevated = self.orig_elevated
+        agent.append_history = self.orig_history
+        agent.run_full_audit = self.orig_audit
+        agent._push_remediation_evidence = self.orig_push
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -41,6 +60,103 @@ class RollbackTests(unittest.TestCase):
             self.calls.append(argv)
             return rc, out
         agent._run_no_shell = runner
+
+    # ---- preflight jalur akses ----
+    def test_access_preflight_blocks_rdp_plan_on_remote_session(self):
+        with mock.patch.dict(os.environ, {"SESSIONNAME": "RDP-Tcp#3"}, clear=False), \
+                mock.patch.object(agent.platform, "system", return_value="Windows"):
+            blocking, notes = agent._access_preflight([{"alias": "ports-block-windows"}])
+        self.assertTrue(blocking)
+        self.assertTrue(any("RDP 3389" in n for n in notes))
+        self.assertTrue(any("REMOTE" in n for n in notes))
+
+    def test_access_preflight_not_blocking_on_console(self):
+        with mock.patch.dict(os.environ, {"SESSIONNAME": "Console"}, clear=False), \
+                mock.patch.object(agent.platform, "system", return_value="Windows"):
+            blocking, notes = agent._access_preflight([{"alias": "ports-block-windows"}])
+        self.assertFalse(blocking)
+        self.assertTrue(notes)
+
+    def test_access_preflight_ignores_safe_alias(self):
+        blocking, notes = agent._access_preflight([{"alias": "auditd-enable"}])
+        self.assertFalse(blocking)
+        self.assertEqual(notes, [])
+
+    # ---- dead-man timer ----
+    def test_deadman_rollback_restores_snapshots_and_writes_result(self):
+        bucket = os.path.join(self.tmp, "bk")
+        os.makedirs(bucket, exist_ok=True)
+        state = {"value": "after"}
+        agent.ALLOWLIST_ANALISA["aa-test-alias"] = {
+            "os": "any", "risk": "LOW",
+            "read": lambda: dict(state),
+            "rollback": lambda pre: (state.update(pre), {"exitCode": 0, "output": "ok"})[1],
+        }
+        for index, value in enumerate(["one", "two"]):
+            with open(os.path.join(bucket, f"PLAN-TEST_aa-test-alias_{index}.json"), "w") as f:
+                json.dump({"planId": "PLAN-TEST", "alias": "aa-test-alias", "preState": {"value": value}}, f)
+        result = agent.run_deadman_rollback("PLAN-TEST", bucket)
+        self.assertEqual(result["status"], "ROLLED_BACK")
+        self.assertEqual(result["restored"], 2)
+        self.assertTrue(os.path.exists(os.path.join(bucket, "deadman-result-PLAN-TEST.json")))
+
+    def test_deadman_disarm_writes_confirm_file(self):
+        with mock.patch.object(agent.platform, "system", return_value="Linux"):
+            agent._deadman_disarm("PLAN-X")
+        self.assertTrue(os.path.exists(agent._deadman_confirm_path("PLAN-X")))
+
+    # ---- persistensi firewall ----
+    def test_firewall_persisted_checks_rules_file(self):
+        agent._read_text = lambda _p: "-A INPUT -p tcp -m tcp --dport 445 -j DROP\n"
+        self.assertTrue(agent._firewall_persisted([445]))
+        self.assertFalse(agent._firewall_persisted([23]))
+        agent._read_text = lambda _p: ""
+        self.assertFalse(agent._firewall_persisted([445]))
+
+    # ---- resume plan terputus ----
+    def test_resume_skips_verified_step_and_carries_evidence(self):
+        state = {"a": "pre", "b": "pre"}
+        calls = []
+
+        def make(alias, key):
+            return {
+                "os": "any", "risk": "LOW",
+                "read": lambda: {key: state[key]},
+                "apply": lambda: (state.__setitem__(key, "post"), calls.append(alias), {"exitCode": 0, "output": "ok"})[2],
+                "verify": lambda: state[key] == "post",
+                "rollback": lambda pre: (state.__setitem__(key, pre[key]), {"exitCode": 0, "output": "rb"})[1],
+            }
+
+        agent.ALLOWLIST_ANALISA["aa-resume-a"] = make("aa-resume-a", "a")
+        agent.ALLOWLIST_ANALISA["aa-resume-b"] = make("aa-resume-b", "b")
+        plan = {
+            "planId": "PLAN-RESUME", "deviceId": "RESUME-NODE",
+            "items": [{"alias": "aa-resume-a"}, {"alias": "aa-resume-b"}],
+            "nonce": "abc", "signature": "sig",
+            "evidence": [{"stepIndex": 0, "alias": "aa-resume-a", "exitCode": 0, "outputHash": "sha256:old", "verified": True}],
+        }
+        plan_path = os.path.join(self.tmp, "plan.json")
+        with open(plan_path, "w") as f:
+            json.dump(plan, f)
+        args = argparse.Namespace(
+            remediate_plan=plan_path, plan_id=None, demo=False, no_exec=False,
+            hmac_key="k", remediate_token="abc.sig", push_url="http://x",
+            remediate_api_key="k", deadman_seconds=0, resume=True, force_access_risk=True,
+        )
+        pushed = {}
+        agent._validate_remediation_token = lambda *a: (True, "ok")
+        agent._is_elevated = lambda: True
+        agent.append_history = lambda *a, **k: ([], "")
+        agent.run_full_audit = lambda *a, **k: {
+            "scoring": {"cyber_readiness_score": 100},
+            "compliance_matrix": [{"parameter": "Network & Dangerous Ports Filtering", "status": "PASS"}],
+        }
+        agent._push_remediation_evidence = lambda *a, **k: pushed.setdefault("evidence", a[5]) or 200
+
+        agent.run_remediation(args)
+        self.assertEqual(calls, ["aa-resume-b"])
+        self.assertEqual({e["alias"] for e in pushed["evidence"]}, {"aa-resume-a", "aa-resume-b"})
+
 
     # ---- firewall Windows ----
     def test_fw_rollback_keeps_on_when_previously_active(self):
@@ -118,7 +234,12 @@ class RollbackTests(unittest.TestCase):
         state.setdefault("protectors", [])
         state.setdefault("recoveryKeys", [])
         self.ps_calls = []
+        self.reg_calls = []
         enabled_once = {"n": 0}
+
+        def reg(argv, timeout=10):
+            self.reg_calls.append(argv)
+            return 0, ""
 
         def ps(cmd, timeout=20):
             self.ps_calls.append(cmd)
@@ -147,14 +268,24 @@ class RollbackTests(unittest.TestCase):
             return 0, ""
 
         orig_state, orig_ps = agent._win_bitlocker_state, agent._win_ps
+        orig_run = agent._run_no_shell
         agent._win_bitlocker_state = lambda: {
             "protectionOn": state.get("protectionOn", False),
+            "protectionStatus": "On" if state.get("protectionOn") else "Off",
+            "volumeStatus": state.get("volumeStatus") or (
+                "FullyEncrypted" if state.get("encrypted") else "FullyDecrypted"),
             "encrypted": state.get("encrypted", False),
+            "encryptionPercentage": state.get(
+                "encryptionPercentage", 100 if state.get("encrypted") else 0),
             "protectors": list(state["protectors"]),
             "recoveryKeys": list(state["recoveryKeys"]),
+            "fve": {},
         }
         agent._win_ps = ps
-        self.addCleanup(lambda: (setattr(agent, "_win_bitlocker_state", orig_state), setattr(agent, "_win_ps", orig_ps)))
+        agent._run_no_shell = reg
+        self.addCleanup(lambda: (setattr(agent, "_win_bitlocker_state", orig_state),
+                                 setattr(agent, "_win_ps", orig_ps),
+                                 setattr(agent, "_run_no_shell", orig_run)))
 
     def test_bitlocker_idempoten_bila_sudah_aktif(self):
         self._bl_harness({"protectionOn": True, "encrypted": True})
@@ -195,6 +326,81 @@ class RollbackTests(unittest.TestCase):
         self.assertTrue(any("-PasswordProtector" in c for c in self.ps_calls))
         self.assertFalse(any("-TpmProtector" in c for c in self.ps_calls))
 
+    def test_bitlocker_boot_password_hanya_angka(self):
+        """Pre-boot memakai layout dasar: '_' / '-' tidak bisa diketik (kasus lapangan)."""
+        self._bl_harness({"protectionOn": False, "encrypted": False}, tpm=False)
+        res = agent._win_bitlocker_apply()
+        pw = res.get("bootPassword")
+        self.assertTrue(pw)
+        self.assertTrue(pw.isdigit(), f"password bukan angka: {pw!r}")
+        self.assertGreaterEqual(len(pw), 12)
+        self.assertTrue(any(f"'{pw}'" in c for c in self.ps_calls))
+
+    def test_bitlocker_boot_password_generator_numerik(self):
+        for _ in range(20):
+            pw = agent._win_bitlocker_boot_password()
+            self.assertTrue(pw.isdigit(), pw)
+            self.assertEqual(len(pw), 20)
+
+    def test_bitlocker_tanpa_tpm_memasang_policy_fve(self):
+        """Tanpa TPM, Windows menolak volume OS (0x8028400F) sampai policy dipasang."""
+        self._bl_harness({"protectionOn": False, "encrypted": False}, tpm=False)
+        agent._win_bitlocker_apply()
+        regs = [c for c in self.reg_calls if c[:2] == ["reg", "add"]]
+        names = [c[c.index("/v") + 1] for c in regs if "/v" in c]
+        self.assertIn("EnableBdeWithNoTPM", names)
+        self.assertIn("UseAdvancedStartup", names)
+        # Keempat opsi TPM harus "Allow" (2), bukan 0 — kalau tidak: 0x8031005B.
+        for opt in ("UseTPM", "UseTPMPIN", "UseTPMKey", "UseTPMKeyPIN"):
+            cmd = next(c for c in regs if "/v" in c and c[c.index("/v") + 1] == opt)
+            self.assertEqual(cmd[cmd.index("/d") + 1], "2", opt)
+        # Policy harus dipasang SEBELUM Enable-BitLocker dijalankan.
+        first_enable = next(i for i, c in enumerate(self.ps_calls) if "Enable-BitLocker" in c)
+        self.assertTrue(first_enable >= 0)
+        self.assertTrue(any("EnableBdeWithNoTPM" in c for c in self.reg_calls))
+
+    def test_bitlocker_dengan_tpm_tidak_menyentuh_policy_fve(self):
+        self._bl_harness({"protectionOn": False, "encrypted": False}, tpm=True)
+        agent._win_bitlocker_apply()
+        self.assertFalse(any("EnableBdeWithNoTPM" in c for c in self.reg_calls))
+
+    def test_bitlocker_menunggu_status_volume_siap(self):
+        """Enable-BitLocker kembali sebelum status ter-update: jangan langsung gagal."""
+        state = {"protectionOn": False, "encrypted": False}
+        self._bl_harness(state, tpm=True)
+        reads = {"n": 0}
+        ready = {"protectionOn": True, "encrypted": False, "encryptionPercentage": 3,
+                 "protectors": ["RecoveryPassword", "Tpm"], "recoveryKeys": ["k"], "fve": {}}
+
+        def fake_state():
+            reads["n"] += 1
+            if reads["n"] >= 3:
+                return ready
+            return {"protectionOn": False, "encrypted": False, "encryptionPercentage": 0,
+                    "protectors": [], "recoveryKeys": [], "fve": {}}
+
+        orig_state = agent._win_bitlocker_state
+        agent._win_bitlocker_state = fake_state
+        try:
+            with mock.patch.object(agent.time, "sleep", lambda _s: None):
+                res = agent._win_bitlocker_apply()
+        finally:
+            agent._win_bitlocker_state = orig_state
+        self.assertEqual(res["exitCode"], 0)
+        self.assertGreaterEqual(reads["n"], 3)
+
+    def test_bitlocker_rollback_memulihkan_policy_fve(self):
+        self._bl_harness({"protectionOn": False, "encrypted": False})
+        pre = {"protectionOn": False, "encrypted": False,
+               "fve": {"EnableBdeWithNoTPM": None, "UseAdvancedStartup": 1}}
+        agent._win_bitlocker_rollback(pre)
+        regs = [c for c in self.reg_calls if c[:2] == ["reg", "delete"]]
+        deleted = [c[c.index("/v") + 1] for c in regs if "/v" in c]
+        self.assertIn("EnableBdeWithNoTPM", deleted)
+        restored = [c for c in self.reg_calls if c[:2] == ["reg", "add"] and "UseAdvancedStartup" in c]
+        self.assertTrue(restored)
+        self.assertIn("1", restored[0])
+
     def test_bitlocker_resume_tanpa_tpm_menambah_password_protector(self):
         self._bl_harness({"protectionOn": False, "encrypted": True}, tpm=False)
         res = agent._win_bitlocker_apply()
@@ -213,6 +419,48 @@ class RollbackTests(unittest.TestCase):
         agent._win_bitlocker_rollback({"protectionOn": False, "encrypted": False})
         self.assertIn("-off", self.calls[0])
 
+    def test_bitlocker_enkripsi_berjalan_dianggap_sukses(self):
+        """ProtectionStatus Off saat konversi berjalan bukan kegagalan."""
+        st = {"protectionOn": False, "encryptionPercentage": 3,
+              "volumeStatus": "EncryptionInProgress",
+              "protectors": ["Password", "RecoveryPassword"], "encrypted": False}
+        self.assertTrue(agent._win_bitlocker_ok(st))
+        self.assertTrue(agent._win_bitlocker_ok(
+            {"protectionOn": True, "encryptionPercentage": 3, "protectors": [], "encrypted": False}))
+
+    def test_bitlocker_dekripsi_bukan_sukses(self):
+        st = {"protectionOn": False, "encryptionPercentage": 40,
+              "volumeStatus": "DecryptionInProgress",
+              "protectors": ["RecoveryPassword"], "encrypted": False}
+        self.assertFalse(agent._win_bitlocker_ok(st))
+
+    def test_bitlocker_enkripsi_tanpa_protector_bukan_sukses(self):
+        st = {"protectionOn": False, "encryptionPercentage": 5,
+              "volumeStatus": "EncryptionInProgress",
+              "protectors": [], "encrypted": False}
+        self.assertFalse(agent._win_bitlocker_ok(st))
+
+    def test_bitlocker_boot_password_tetap_dilaporkan_saat_gagal(self):
+        """Password yang sudah terpasang tidak boleh hilang saat enable gagal."""
+        state = {"protectionOn": False, "encrypted": False}
+        self._bl_harness(state, tpm=False)
+
+        def ps(cmd, timeout=20):
+            if "Enable-BitLocker" in cmd:
+                state["protectors"].append("Password")
+                return 1, "enable gagal uji"
+            return 0, ""
+
+        agent._win_ps = ps
+        res = agent._win_bitlocker_apply()
+        self.assertEqual(res["exitCode"], 1)
+        self.assertTrue(res.get("bootPassword"))
+
+    def test_bitlocker_rollback_hapus_password_acak(self):
+        self._mock_run(0, "ok")
+        agent._win_bitlocker_rollback({"protectionOn": False, "encrypted": False, "protectors": []})
+        self.assertTrue(any("-protectors" in " ".join(c) and "Password" in c for c in self.calls))
+
     # ---- USBSTOR ----
     def test_usbstor_restore_returns_previous_value(self):
         self._mock_run(0, "ok")
@@ -222,7 +470,22 @@ class RollbackTests(unittest.TestCase):
         agent._win_usbstor_restore({"start": 4})
         self.assertIn("4", self.calls[0])
 
+    @unittest.skipUnless(os.name == 'nt', 'audit USBSTOR hanya di Windows')
+    def test_audit_usb_memakai_state_yang_sama_dengan_remediasi(self):
+        """Audit ulang wajib membaca USBSTOR lewat _win_usbstor_state, bukan subprocess mentah."""
+        original = agent._win_usbstor_state
+        try:
+            agent._win_usbstor_state = lambda: {"start": 4}
+            self.assertEqual(agent.audit_endpoint_protection()["status"], "PASS")
+            agent._win_usbstor_state = lambda: {"start": 3}
+            self.assertEqual(agent.audit_endpoint_protection()["status"], "WARNING")
+            agent._win_usbstor_state = lambda: {"start": None}
+            self.assertEqual(agent.audit_endpoint_protection()["status"], "WARNING")
+        finally:
+            agent._win_usbstor_state = original
+
     # ---- GRUB ----
+    @unittest.skipIf(os.name == 'nt', 'chmod POSIX tidak berlaku di Windows')
     def test_grub_apply_and_rollback_restore_mode(self):
         grub = os.path.join(self.tmp, "grub.cfg")
         with open(grub, "w") as f:
@@ -252,9 +515,50 @@ class RollbackTests(unittest.TestCase):
         self.assertNotIn("NOPASSWD", open(sfile).read())
         self.assertEqual(agent._linux_sudoers_rollback(pre)["exitCode"], 0)
         self.assertIn("NOPASSWD", open(sfile).read())
-        self.assertEqual(oct(os.stat(sfile).st_mode)[-3:], "440")
+        # Windows hanya membedakan read-only ↔ writable (0440 terbaca 0444); Linux tetap 0440.
+        self.assertIn(oct(os.stat(sfile).st_mode)[-3:], ("440", "444"))
+
+    def _mock_run_map(self, mapping):
+        def runner(argv, timeout=10):
+            self.calls.append(argv)
+            for prefix, result in mapping.items():
+                if argv[:len(prefix)] == list(prefix):
+                    return result
+            return 0, "ok"
+        agent._run_no_shell = runner
+
+    def test_sudoers_cloud_init_keeps_nopasswd_when_user_has_no_password(self):
+        sfile = os.path.join(self.tmp, "90-cloud-init-users")
+        original = "ubuntu ALL=(ALL) NOPASSWD:ALL\n"
+        with open(sfile, "w") as f:
+            f.write(original)
+        agent._sudoers_files = lambda: [sfile]
+        self._mock_run_map({
+            ("visudo",): (0, ""),
+            ("passwd", "-S", "ubuntu"): (0, "ubuntu L 01/01/2026 0 99999 7 -1"),
+        })
+        res = agent._linux_sudoers_apply()
+        self.assertEqual(res["exitCode"], 0)
+        self.assertIn("NOPASSWD", open(sfile).read())
+        self.assertIn("dipertahankan", res["output"])
+        self.assertTrue(agent._linux_sudoers_verify())
+
+    def test_sudoers_apply_aborts_and_keeps_file_when_visudo_rejects(self):
+        sfile = os.path.join(self.tmp, "custom-sudoers")
+        original = "%sudo ALL=(ALL:ALL) NOPASSWD: ALL\n"
+        with open(sfile, "w") as f:
+            f.write(original)
+        agent._sudoers_files = lambda: [sfile]
+        self._mock_run_map({("visudo",): (1, "syntax error near line 1")})
+        res = agent._linux_sudoers_apply()
+        self.assertEqual(res["exitCode"], -1)
+        self.assertIn("dibatalkan", res["output"])
+        self.assertEqual(open(sfile).read(), original)
+        self.assertFalse(os.path.exists(sfile + ".pasopati.tmp"))
+
 
     # ---- SUID ----
+    @unittest.skipIf(os.name == 'nt', 'bit SUID tidak berlaku di Windows')
     def test_suid_apply_and_rollback_restore_bit(self):
         target = os.path.join(self.tmp, "bash")
         with open(target, "w") as f:
@@ -344,7 +648,7 @@ class UnifiedPlanTests(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="pasopati-unified-")
-        self.orig = (agent.ALLOWLIST_ANALISA, set(agent.ADVISORY_ALIASES), agent._remediation_backup_dir, agent._is_elevated, agent._push_remediation_evidence)
+        self.orig = (agent.ALLOWLIST_ANALISA, set(agent.ADVISORY_ALIASES), agent._remediation_backup_dir, agent._is_elevated, agent._push_remediation_evidence, agent.run_full_audit)
         self.rollback_called = []
         self.enforce_ok = True
         self.pushed = None
@@ -369,14 +673,18 @@ class UnifiedPlanTests(unittest.TestCase):
         agent.ADVISORY_ALIASES = {"fake-advisory"}
         agent._remediation_backup_dir = lambda: self.tmp
         agent._is_elevated = lambda: True
-        def _push(server_url, api_key, plan_id, nonce, to_status, evidence, hmac_key=None):
-            self.pushed = {"planId": plan_id, "status": to_status, "evidence": evidence, "hmacKey": hmac_key}
+        def _push(server_url, api_key, plan_id, nonce, to_status, evidence, hmac_key=None, post_audit=None):
+            self.pushed = {"planId": plan_id, "status": to_status, "evidence": evidence, "hmacKey": hmac_key, "postAudit": post_audit}
             return 200
         agent._push_remediation_evidence = _push
+        agent.run_full_audit = lambda *a, **k: {
+            "scoring": {"cyber_readiness_score": 90},
+            "compliance_matrix": [{"parameter": "Network & Dangerous Ports Filtering", "status": "PASS"}],
+        }
 
     def tearDown(self):
         import shutil
-        (agent.ALLOWLIST_ANALISA, agent.ADVISORY_ALIASES, agent._remediation_backup_dir, agent._is_elevated, agent._push_remediation_evidence) = self.orig
+        (agent.ALLOWLIST_ANALISA, agent.ADVISORY_ALIASES, agent._remediation_backup_dir, agent._is_elevated, agent._push_remediation_evidence, agent.run_full_audit) = self.orig
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _run(self, items):

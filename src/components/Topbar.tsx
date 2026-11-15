@@ -11,9 +11,11 @@ interface TopbarProps {
   onOpenMobile: () => void;
   onSelectDevice: (deviceId: string) => void;
   onNavigate: (tab: number) => void;
+  principalName: string | null;
+  principalRole: string | null;
 }
 
-const TAB_TITLES = ['Dashboard', 'Endpoint Audit', 'Hardening & Remediation', 'Agent & Upload', 'Audit Log'];
+const TAB_TITLES = ['Dashboard', 'Endpoint Audit', 'Hardening & Remediation', 'Agent & Upload', 'Audit Log', 'Audit Endpoint & Kondisi'];
 
 export const Topbar: React.FC<TopbarProps> = ({
   activeTab,
@@ -21,10 +23,17 @@ export const Topbar: React.FC<TopbarProps> = ({
   auditLogCount,
   onOpenMobile,
   onSelectDevice,
-  onNavigate
+  onNavigate,
+  principalName,
+  principalRole
 }) => {
   const [query, setQuery] = useState('');
   const [focused, setFocused] = useState(false);
+  const roleLabel = principalRole === 'admin'
+    ? 'Administrator'
+    : principalRole === 'viewer'
+      ? 'User biasa · Viewer'
+      : principalRole || 'Operator';
 
   const results = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -151,14 +160,14 @@ export const Topbar: React.FC<TopbarProps> = ({
           <button
             onClick={() => onNavigate(0)}
             className="flex items-center gap-2 rounded-full py-1 pl-1 pr-2 hover:bg-white/5"
-            title="Puskodal Operator — Administrator"
+            title={`${principalName || 'Operator'} — ${roleLabel}`}
           >
             <span className="flex h-9 w-9 items-center justify-center overflow-hidden rounded-full border border-[#343b49] bg-[#0b0e14]">
               <img src="/pasopati-mark.png" alt="Operator" className="h-9 w-9 object-cover" />
             </span>
             <span className="hidden text-left sm:block">
-              <span className="block text-[12px] font-bold leading-tight text-slate-200">Puskodal Operator</span>
-              <span className="block text-[10px] font-mono text-slate-500">Administrator</span>
+              <span className="block max-w-32 truncate text-[12px] font-bold leading-tight text-slate-200">{principalName || 'Operator'}</span>
+              <span className="block text-[10px] font-mono text-slate-500">{roleLabel}</span>
             </span>
             <ChevronDown className="hidden h-3.5 w-3.5 text-slate-500 sm:block" />
           </button>

@@ -26,13 +26,16 @@ import platform
 import subprocess
 import datetime
 import argparse
+import glob
 import uuid
 import tempfile
 import atexit
+import shutil
 import hmac
 import hashlib
 import re
 import secrets
+import ssl
 import time
 import urllib.request
 import urllib.error
@@ -93,6 +96,17 @@ def get_primary_ip():
         s.close()
     return ip
 
+def _dedupe_ports(entries):
+    seen = set()
+    result = []
+    for entry in entries:
+        port = entry.get("port")
+        if port in seen:
+            continue
+        seen.add(port)
+        result.append(entry)
+    return result
+
 def scan_listening_ports():
     open_ports = []
     if HAS_PSUTIL:
@@ -122,7 +136,7 @@ def scan_listening_ports():
                         "risk_level": crit_meta.get("risk", "INFO"),
                         "threat_desc": crit_meta.get("desc", "Layanan listening aktif.")
                     })
-            return open_ports
+            return _dedupe_ports(open_ports)
         except Exception:
             pass
 
@@ -164,7 +178,7 @@ def scan_listening_ports():
             "risk_level": crit_meta.get("risk", "INFO"),
             "threat_desc": crit_meta.get("desc", "Layanan terdeteksi merespons pada socket lokal.")
         })
-    return open_ports
+    return _dedupe_ports(open_ports)
 
 # ==============================================================================
 # MODULE 1: KERNEL & BOOT INTEGRITY (CIS 1.1 / DISA STIG KRN-001)
@@ -305,20 +319,39 @@ def audit_crypto_storage():
 
     elif 'windows' in current_os:
         bitlocker_active = False
+        bitlocker_in_progress = False
         bitlocker_query_ok = True
+        bitlocker_pct = 0
         try:
-            res = subprocess.run(["manage-bde", "-status", "C:"], capture_output=True, text=True, timeout=4)
-            if "Protection On" in res.stdout or "Perlindungan Aktif" in res.stdout or "Percentage Encrypted: 100" in res.stdout:
-                bitlocker_active = True
+            _bl = _win_bitlocker_state()
+            bitlocker_pct = _bl.get("encryptionPercentage") or 0
+            bitlocker_active = bool(_bl.get("protectionOn")) or bool(_bl.get("encrypted"))
+            # Enkripsi yang masih berjalan bukan kegagalan: protector sudah ada,
+            # proteksi menyala setelah konversi selesai/reboot.
+            bitlocker_in_progress = (not bitlocker_active) and _win_bitlocker_ok(_bl)
         except Exception:
             bitlocker_query_ok = False
+
+        if bitlocker_active:
+            bl_status = "PASS"
+            bl_details = "Volume sistem C: terproteksi BitLocker XTS-AES 256-bit."
+        elif bitlocker_in_progress:
+            bl_status = "WARNING"
+            bl_details = (f"Enkripsi BitLocker sedang berjalan ({bitlocker_pct}%); "
+                          "proteksi aktif setelah enkripsi selesai/reboot.")
+        elif bitlocker_query_ok:
+            bl_status = "FAIL"
+            bl_details = "Volume C: tidak terenkripsi BitLocker! Data taktis berisiko dicuri via physical extraction."
+        else:
+            bl_status = "WARNING"
+            bl_details = "Status BitLocker tidak terbaca (butuh Administrator); verifikasi manual."
 
         findings.append({
             "parameter": "BitLocker Drive Encryption (FDE)",
             "category": "Cryptographic Posture",
             "cis_id": "DISA STIG WN11-00-000025",
-            "status": "PASS" if bitlocker_active else ("FAIL" if bitlocker_query_ok else "WARNING"),
-            "details": "Volume sistem C: terproteksi BitLocker XTS-AES 256-bit." if bitlocker_active else "Volume C: tidak terenkripsi BitLocker! Data taktis berisiko dicuri via physical extraction."
+            "status": bl_status,
+            "details": bl_details
         })
 
     return findings
@@ -534,33 +567,26 @@ def audit_endpoint_protection():
             "details": "Driver modul USB mass storage dibatasi untuk proteksi data taktis." if usb_blocked else "USB Mass Storage tidak dibatasi (potensi eksfiltrasi data via removable media)."
         }
     elif 'windows' in current_os:
-        try:
-            rc, out = subprocess.run(["reg", "query", _USBSTOR_KEY, "/v", "Start"], capture_output=True, text=True, timeout=4)
-            m = __import__("re").search(r"Start\s+REG_DWORD\s+(0x[0-9a-fA-F]+|\d+)", out or "")
-            if rc == 0 and m:
-                blocked = int(m.group(1), 0) == 4
-                return {
-                    "parameter": "USB Storage Device Control",
-                    "category": "Endpoint Protection",
-                    "cis_id": "DISA STIG WN11-CC-000180",
-                    "status": "PASS" if blocked else "WARNING",
-                    "details": "Driver USBSTOR dinonaktifkan via registry (Start=4)." if blocked else "USB Mass Storage masih aktif (Start!=4)."
-                }
+        # Satu sumber pembacaan dengan langkah remediasi (usb-storage-block),
+        # supaya hasil audit ulang tidak berbeda dari pre-state/verify.
+        st = _win_usbstor_state()
+        start = st.get("start")
+        if start is not None:
+            blocked = start == 4
             return {
                 "parameter": "USB Storage Device Control",
                 "category": "Endpoint Protection",
                 "cis_id": "DISA STIG WN11-CC-000180",
-                "status": "WARNING",
-                "details": "Kunci registry USBSTOR tidak terbaca; verifikasi manual diperlukan."
+                "status": "PASS" if blocked else "WARNING",
+                "details": "Driver USBSTOR dinonaktifkan via registry (Start=4)." if blocked else "USB Mass Storage masih aktif (Start!=4)."
             }
-        except Exception:
-            return {
-                "parameter": "USB Storage Device Control",
-                "category": "Endpoint Protection",
-                "cis_id": "DISA STIG WN11-CC-000180",
-                "status": "WARNING",
-                "details": "Verifikasi kebijakan USB Mass Storage memerlukan hak administrator."
-            }
+        return {
+            "parameter": "USB Storage Device Control",
+            "category": "Endpoint Protection",
+            "cis_id": "DISA STIG WN11-CC-000180",
+            "status": "WARNING",
+            "details": "Kunci registry USBSTOR tidak terbaca; verifikasi manual diperlukan."
+        }
     return {
         "parameter": "Peripheral Storage Isolation",
         "category": "Endpoint Protection",
@@ -634,8 +660,12 @@ def audit_system_logging():
                 ev_status = "PASS"
                 ev_details = "Windows Event Log Security dapat diakses dan berjalan normal."
             else:
-                ev_status = "FAIL"
-                ev_details = "Windows Event Log Security tidak dapat diakses/query."
+                ev_status = "WARNING"
+                stderr = (res.stderr or "").lower()
+                if "access" in stderr or "akses" in stderr:
+                    ev_details = "Event Log Security butuh hak Administrator untuk dibaca (WARNING, bukan FAIL)."
+                else:
+                    ev_details = "Windows Event Log Security tidak dapat di-query; verifikasi manual."
         except Exception:
             ev_status = "WARNING"
             ev_details = "Query Windows Event Log memerlukan hak akses administrator."
@@ -655,6 +685,444 @@ def audit_system_logging():
     }
 
 # ==============================================================================
+# MODULE 4: HARDENING BASELINE TAMBAHAN (Windows 11 / CIS / STIG)
+# ==============================================================================
+# Semua pembacaan read-only. Nilai tidak terbaca → WARNING (bukan FAIL palsu),
+# kecuali konfigurasi terbaca dan jelas melanggar.
+_WIN_SMB_SRV = r"HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters"
+_WIN_DEFENDER_RTP = r"HKLM\SOFTWARE\Microsoft\Windows Defender\Real-Time Protection"
+_WIN_DNS_POLICY = r"HKLM\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"
+_WIN_EXPLORER_POLICY = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer"
+
+def _reg_dword(path, name):
+    rc, out = _run_no_shell(["reg", "query", path, "/v", name], 5)
+    if rc != 0:
+        return None
+    m = re.search(re.escape(name) + r"\s+REG_DWORD\s+(0x[0-9a-fA-F]+|\d+)", out or "")
+    return int(m.group(1), 0) if m else None
+
+def _reg_string(path, name):
+    rc, out = _run_no_shell(["reg", "query", path, "/v", name], 5)
+    if rc != 0:
+        return None
+    m = re.search(re.escape(name) + r"\s+REG_\w+\s+(.+)", out or "")
+    return m.group(1).strip() if m else None
+
+def _win_service_state(name):
+    rc, out = _run_no_shell(["sc", "qc", name], 5)
+    if rc != 0:
+        return None
+    low = (out or "").upper()
+    if "DISABLED" in low:
+        return "disabled"
+    return "configured"
+
+def _net_accounts_value(label_en, label_id):
+    rc, out = _run_no_shell(["net", "accounts"], 5)
+    if rc != 0:
+        return None
+    for line in (out or "").splitlines():
+        low = line.lower()
+        if label_en.lower() in low or label_id.lower() in low:
+            nums = re.findall(r"-?\d+", line.replace(":", " "))
+            # "Never"/"Tidak pernah" → 0, jangan dianggap tidak terbaca.
+            return int(nums[-1]) if nums else 0
+    return None
+
+def audit_windows_hardening():
+    findings = []
+    def add(parameter, cis, status, details):
+        findings.append({
+            "parameter": parameter, "category": "Access Control",
+            "cis_id": cis, "status": status, "details": details
+        })
+
+    lua = _reg_dword(_WIN_UAC_KEY if "_WIN_UAC_KEY" in globals() else r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", "EnableLUA")
+    add("User Account Control (UAC) Enforcement", "DISA STIG WN11-SO-000250",
+        "WARNING" if lua is None else ("PASS" if lua == 1 else "FAIL"),
+        "UAC tidak terbaca." if lua is None else ("UAC aktif (EnableLUA=1)." if lua == 1 else "UAC DINONAKTIFKAN (EnableLUA=0)."))
+
+    nla = _reg_dword(r"HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp", "UserAuthentication")
+    add("RDP Network Level Authentication (NLA)", "DISA STIG WN11-CC-000040",
+        "WARNING" if nla is None else ("PASS" if nla == 1 else "FAIL"),
+        "Status NLA tidak terbaca." if nla is None else ("NLA wajib (UserAuthentication=1)." if nla == 1 else "NLA tidak diwajibkan pada RDP."))
+
+    smb1 = _reg_dword(_WIN_SMB_SRV, "SMB1")
+    add("SMBv1 Protocol", "CIS 2.3.9 / DISA STIG WN11-00-000165",
+        "PASS" if smb1 in (None, 0) else "FAIL",
+        "SMB1 tidak diset (default modern nonaktif)." if smb1 is None else ("SMBv1 nonaktif." if smb1 == 0 else "SMBv1 AKTIF."))
+
+    signing = _reg_dword(_WIN_SMB_SRV, "RequireSecuritySignature")
+    add("SMB Signing Required", "CIS 2.3.8 / DISA STIG WN11-00-000170",
+        "WARNING" if signing is None else ("PASS" if signing == 1 else "FAIL"),
+        "Nilai SMB signing tidak terbaca." if signing is None else ("SMB signing diwajibkan." if signing == 1 else "SMB signing tidak diwajibkan."))
+
+    rtp = _reg_dword(_WIN_DEFENDER_RTP, "DisableRealtimeMonitoring")
+    add("Microsoft Defender Real-Time Protection", "DISA STIG WN11-00-000045",
+        "PASS" if rtp in (None, 0) else "FAIL",
+        "Real-time protection aktif (kunci tidak dimatikan)." if rtp is None else ("Real-time protection aktif." if rtp == 0 else "Real-time protection DIMATIKAN."))
+
+    llmnr = _reg_dword(_WIN_DNS_POLICY, "EnableMulticast")
+    add("LLMNR Resolution Disabled", "CIS 18.5.4.2",
+        "WARNING" if llmnr is None else ("PASS" if llmnr == 0 else "FAIL"),
+        "Kebijakan LLMNR belum diset." if llmnr is None else ("LLMNR nonaktif." if llmnr == 0 else "LLMNR aktif (rawan poisoning)."))
+
+    autorun = _reg_dword(_WIN_EXPLORER_POLICY, "NoDriveTypeAutoRun")
+    add("Autorun/Autoplay Restriction", "CIS 18.9.14.1",
+        "WARNING" if autorun is None else ("PASS" if autorun == 255 else "FAIL"),
+        "Kebijakan autoplay belum diset." if autorun is None else ("Autoplay dimatikan untuk semua drive." if autorun == 255 else f"Autoplay masih aktif (0x{autorun:X})."))
+
+    policy = _reg_string(r"HKLM\SOFTWARE\Microsoft\PowerShell\1\ShellIds\Microsoft.PowerShell", "ExecutionPolicy")
+    add("PowerShell Execution Policy", "DISA STIG WN11-CC-000225",
+        "WARNING" if not policy else ("PASS" if policy.lower() in ("remotesigned", "allsigned", "restricted") else "FAIL"),
+        "ExecutionPolicy tidak terbaca." if not policy else f"ExecutionPolicy={policy}.")
+
+    winrm = _win_service_state("WinRM")
+    add("WinRM Service Exposure", "DISA STIG WN11-CC-000340",
+        "WARNING" if winrm is None else ("WARNING" if winrm != "disabled" else "PASS"),
+        "Status layanan WinRM tidak terbaca." if winrm is None else ("WinRM aktif (pastikan memang dipakai)." if winrm != "disabled" else "WinRM nonaktif."))
+
+    rc, out = _run_no_shell(["net", "user", "Administrator"], 5)
+    disabled = ("Account active               No" in (out or "")) or ("Akun aktif                   Tidak" in (out or ""))
+    add("Built-in Administrator Account", "CIS 2.3.1.2",
+        "PASS" if disabled else "WARNING",
+        "Akun Administrator bawaan nonaktif." if disabled else "Akun Administrator bawaan aktif — tinjau pemakaiannya.")
+
+    minlen = _net_accounts_value("Minimum password length", "Panjang sandi minimum")
+    add("Password Policy: Minimum Length", "CIS 1.1.4 / DISA STIG WN11-AC-000005",
+        "WARNING" if minlen is None else ("PASS" if minlen >= 14 else "FAIL"),
+        "Kebijakan panjang sandi tidak terbaca." if minlen is None else f"Panjang minimum sandi={minlen} (baseline 14).")
+
+    lockout = _net_accounts_value("Lockout threshold", "Ambang penguncian")
+    add("Account Lockout Threshold", "CIS 1.2.2 / DISA STIG WN11-AC-000010",
+        "WARNING" if lockout is None else ("PASS" if 0 < lockout <= 5 else "FAIL"),
+        "Ambang penguncian tidak terbaca." if lockout is None else f"Ambang penguncian={lockout} (baseline 1-5).")
+
+    auditpol = _win_auditpol_state() if "_win_auditpol_state" in globals() else {"readable": False}
+    add("Audit Process Creation Policy", "DISA STIG WN11-AU-000050",
+        "WARNING" if not auditpol.get("readable") else ("PASS" if auditpol.get("success") else "FAIL"),
+        "Kebijakan audit process creation tidak terbaca." if not auditpol.get("readable") else
+        ("Process creation diaudit (success)." if auditpol.get("success") else "Process creation TIDAK diaudit."))
+
+    wuauserv = _win_service_state("wuauserv")
+    add("Windows Update Service", "CIS 18.9.102.1",
+        "WARNING" if wuauserv is None else ("PASS" if wuauserv == "configured" else "FAIL"),
+        "Layanan wuauserv tidak terbaca." if wuauserv is None else ("Layanan update aktif." if wuauserv == "configured" else "Layanan update dinonaktifkan."))
+    return findings
+
+# ==============================================================================
+# MODULE 5: HARDENING BASELINE TAMBAHAN (Linux / CIS / STIG)
+# ==============================================================================
+def _sshd_effective(name):
+    rc, out = _run_no_shell(["sshd", "-T"], 10)
+    if rc != 0:
+        return None
+    for line in (out or "").splitlines():
+        if line.lower().startswith(name.lower() + " "):
+            return line.split(None, 1)[1].strip().lower().strip('"')
+    return None
+
+def _sysctl_value(name):
+    text = _read_text("/proc/sys/" + name.replace(".", "/"))
+    return (text or "").strip() if text is not None else None
+
+def _mode_of(path):
+    try:
+        return oct(os.stat(path).st_mode)[-3:]
+    except Exception:
+        return None
+
+def _login_defs_value(key):
+    for line in (_read_text("/etc/login.defs") or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0].upper() == key:
+            return parts[1]
+    return None
+
+def audit_linux_hardening():
+    findings = []
+    def add(parameter, cis, status, details):
+        findings.append({
+            "parameter": parameter, "category": "Access Control",
+            "cis_id": cis, "status": status, "details": details
+        })
+
+    pwauth = _sshd_effective("passwordauthentication")
+    add("SSH Password Authentication", "CIS 5.2.4 / DISA STIG V-238208",
+        "WARNING" if pwauth is None else ("PASS" if pwauth == "no" else "WARNING"),
+        "Nilai efektif tidak terbaca." if pwauth is None else f"PasswordAuthentication={pwauth}.")
+
+    empty = _sshd_effective("permitemptypasswords")
+    add("SSH Empty Password Rejection", "CIS 5.2.5",
+        "WARNING" if empty is None else ("PASS" if empty == "no" else "FAIL"),
+        "Nilai efektif tidak terbaca." if empty is None else f"PermitEmptyPasswords={empty}.")
+
+    maxauth = _sshd_effective("maxauthtries")
+    add("SSH MaxAuthTries", "CIS 5.2.6",
+        "WARNING" if maxauth is None else ("PASS" if maxauth.isdigit() and int(maxauth) <= 4 else "FAIL"),
+        "Nilai efektif tidak terbaca." if maxauth is None else f"MaxAuthTries={maxauth} (baseline <=4).")
+
+    umask = _login_defs_value("UMASK")
+    add("Default UMASK", "CIS 5.4.3",
+        "WARNING" if umask is None else ("PASS" if umask in ("027", "077") else "FAIL"),
+        "UMASK tidak ditemukan di login.defs." if umask is None else f"UMASK={umask}.")
+
+    limits = (_read_text("/etc/security/limits.conf") or "") + (_read_text("/etc/security/limits.d/99-pasopati.conf") or "")
+    core = re.search(r"^\s*\*\s+(soft|hard)\s+core\s+0", limits, re.MULTILINE)
+    add("Core Dump Restriction", "CIS 1.5.1",
+        "PASS" if core else "WARNING",
+        "Core dump dibatasi 0." if core else "Batas core file tidak ditemukan di limits.conf.")
+
+    aslr = _sysctl_value("kernel.randomize_va_space")
+    add("Kernel ASLR", "CIS 1.5.3",
+        "WARNING" if aslr is None else ("PASS" if aslr == "2" else "FAIL"),
+        "Tidak terbaca." if aslr is None else f"randomize_va_space={aslr} (baseline 2).")
+
+    fwd = _sysctl_value("net.ipv4.ip_forward")
+    add("IPv4 Forwarding", "CIS 3.1.1",
+        "WARNING" if fwd is None else ("PASS" if fwd == "0" else "WARNING"),
+        "Tidak terbaca." if fwd is None else f"ip_forward={fwd} (0 = host, 1 = router).")
+
+    redir = _sysctl_value("net.ipv4.conf.all.accept_redirects")
+    add("ICMP Redirect Acceptance", "CIS 3.2.2",
+        "WARNING" if redir is None else ("PASS" if redir == "0" else "FAIL"),
+        "Tidak terbaca." if redir is None else f"accept_redirects={redir}.")
+
+    for path, cis, label in (
+        ("/etc/passwd", "CIS 6.1.2", "max 644"),
+        ("/etc/shadow", "CIS 6.1.3", "max 640"),
+        ("/etc/group", "CIS 6.1.4", "max 644"),
+        ("/etc/crontab", "CIS 5.1.2", "max 600"),
+    ):
+        mode = _mode_of(path)
+        limit = int(label.split()[-1])
+        ok = mode is not None and int(mode, 8) <= int(str(limit), 8)
+        add(f"{path} Permissions", cis,
+            "WARNING" if mode is None else ("PASS" if ok else "FAIL"),
+            "Tidak ada / tidak terbaca." if mode is None else f"Mode {mode} (baseline {label}).")
+
+    world = []
+    try:
+        for name in os.listdir("/etc"):
+            full = os.path.join("/etc", name)
+            if os.path.isfile(full) and not os.path.islink(full):
+                m = os.stat(full).st_mode
+                if m & 0o002:
+                    world.append(name)
+    except Exception:
+        pass
+    add("World-Writable Files in /etc", "CIS 6.1.10",
+        "PASS" if not world else "FAIL",
+        "Tidak ada berkas world-writable di /etc." if not world else f"World-writable: {', '.join(sorted(world)[:8])}.")
+
+    timesync = None
+    for svc in ("systemd-timesyncd", "chronyd", "ntp"):
+        rc, out = _run_no_shell(["systemctl", "is-active", svc], 5)
+        if (out or "").strip() == "active":
+            timesync = svc
+            break
+    add("Time Synchronization Service", "CIS 2.2.1.1",
+        "PASS" if timesync else "WARNING",
+        f"Layanan sinkronisasi waktu aktif ({timesync})." if timesync else "Tidak ada layanan sinkronisasi waktu aktif.")
+
+    aide = shutil.which("aide")
+    add("File Integrity Monitoring (AIDE)", "CIS 1.3.1",
+        "PASS" if aide else "WARNING",
+        "AIDE terpasang." if aide else "AIDE tidak terpasang (verifikasi manual).")
+
+    rules = "/etc/audit/rules.d/audit.rules"
+    has_rules = bool((_read_text(rules) or "").strip())
+    add("Auditd Rules Present", "CIS 4.1.2",
+        "PASS" if has_rules else "WARNING",
+        "Berkas aturan audit tersedia." if has_rules else "Aturan auditd tidak ditemukan.")
+
+    pwq = None
+    for pam in ("/etc/security/pwquality.conf", "/etc/pam.d/common-password"):
+        text = _read_text(pam) or ""
+        m = re.search(r"minlen\s*=?\s*(\d+)", text)
+        if m:
+            pwq = int(m.group(1))
+            break
+    add("PAM Password Quality (minlen)", "CIS 5.4.1",
+        "WARNING" if pwq is None else ("PASS" if pwq >= 14 else "FAIL"),
+        "minlen tidak ditemukan." if pwq is None else f"minlen={pwq} (baseline 14).")
+
+    sudo_ts = None
+    text = _read_text("/etc/sudoers") or ""
+    m = re.search(r"timestamp_timeout\s*=\s*(\d+)", text)
+    if m:
+        sudo_ts = int(m.group(1))
+    add("Sudo Timestamp Timeout", "CIS 5.3.2",
+        "WARNING" if sudo_ts is None else ("PASS" if 0 < sudo_ts <= 15 else "FAIL"),
+        "timestamp_timeout tidak diset (default 5 menit)." if sudo_ts is None else f"timestamp_timeout={sudo_ts}.")
+
+    journal = "/var/log/journal"
+    add("Journald Persistent Storage", "CIS 4.2.1.1",
+        "PASS" if os.path.isdir(journal) else "WARNING",
+        "Journal persisten aktif." if os.path.isdir(journal) else "Journal belum persisten (log hilang saat reboot).")
+    return findings
+
+# ==============================================================================
+# MODULE 6: PROFIL KONTROL DEKLARATIF
+# ==============================================================================# Profil adalah dokumen YAML (isinya JSON — JSON adalah subset YAML, jadi tidak
+# butuh dependensi parser). Satu kontrol = satu objek dengan `check` bertipe.
+# Tipe check: registry, command, sysctl, file_mode, file_content, service,
+# exists, sshd. `na_if`: wsl | missing:<path> | program_missing:<cmd>.
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+AUDIT_PROFILE = "standard"
+_PROFILE_CACHE = {}
+
+def _is_wsl():
+    try:
+        text = (_read_text("/proc/version") or "").lower()
+        return "microsoft" in text or "wsl" in text
+    except Exception:
+        return False
+
+def _load_profile(name):
+    if name in _PROFILE_CACHE:
+        return _PROFILE_CACHE[name]
+    path = os.path.join(ROOT_DIR, "profiles", f"{name}.yaml")
+    controls = []
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("controls"), list):
+                controls = [c for c in data["controls"] if isinstance(c, dict) and c.get("parameter")]
+        except Exception as exc:
+            print(f"[!] Profil {path} gagal dibaca: {exc}")
+    _PROFILE_CACHE[name] = controls
+    return controls
+
+def _profile_na(cond):
+    if not cond:
+        return False
+    kind, _, arg = str(cond).partition(":")
+    if kind == "wsl":
+        return _is_wsl()
+    if kind == "missing":
+        return not os.path.exists(arg)
+    if kind == "program_missing":
+        return shutil.which(arg) is None
+    return False
+
+def _eval_check(check):
+    """Kembalikan (ok, details). Exception → (None, pesan)."""
+    ctype = check.get("type")
+    if ctype == "registry":
+        got = _reg_dword(check["path"], check["name"]) if check.get("dword") else _reg_string(check["path"], check["name"])
+        if got is None:
+            return None, "nilai registry tidak terbaca/tidak ada"
+        expect = check.get("expect")
+        expected = expect if isinstance(expect, list) else [expect]
+        return got in expected, f"nilai={got!r} (harap {expected!r})"
+    if ctype == "command":
+        rc, out = _run_no_shell([str(x) for x in check["argv"]], int(check.get("timeout", 10)))
+        text = (out or "").strip()
+        if check.get("min") is not None or check.get("max") is not None:
+            numbers = re.findall(r"-?\d+", text)
+            if not numbers:
+                return None, "angka tidak ditemukan pada keluaran"
+            value = int(numbers[-1] if check.get("last") else numbers[0])
+            low = check.get("min")
+            high = check.get("max")
+            ok = (low is None or value >= int(low)) and (high is None or value <= int(high))
+            return ok, f"nilai={value} (rentang {low}..{high})"
+        if check.get("output"):
+            hit = re.search(check["output"], text, re.IGNORECASE | re.MULTILINE) is not None
+            if check.get("mode") == "nomatch":
+                hit = not hit
+            return hit, (text[:180] or f"exit {rc}")
+        return rc == int(check.get("expect_exit", 0)), (text[:180] or f"exit {rc}")
+    if ctype == "sysctl":
+        got = _sysctl_value(check["path"])
+        if got is None:
+            return None, "tidak terbaca"
+        expect = check.get("expect")
+        expected = expect if isinstance(expect, list) else [expect]
+        return str(got) in [str(x) for x in expected], f"nilai={got} (harap {expected})"
+    if ctype == "file_mode":
+        mode = _mode_of(check["path"])
+        if mode is None:
+            return None, "berkas tidak ada"
+        return int(mode, 8) <= int(str(check["max"]), 8), f"mode {mode} (maks {check['max']})"
+    if ctype == "file_content":
+        text = _read_text(check["path"])
+        if text is None:
+            return None, "berkas tidak terbaca"
+        problems = []
+        for pattern in check.get("require", []):
+            if not re.search(pattern, text, re.MULTILINE):
+                problems.append(f"tidak ada /{pattern}/")
+        for pattern in check.get("forbid", []):
+            if re.search(pattern, text, re.MULTILINE):
+                problems.append(f"masih ada /{pattern}/")
+        return not problems, ("; ".join(problems) or "sesuai")
+    if ctype == "service":
+        expect = check.get("expect")
+        if platform.system().lower() == "windows":
+            rc, out = _run_no_shell(["sc", "qc", str(check["name"])], 5)
+            if rc != 0:
+                return None, "layanan tidak ada"
+            disabled = "DISABLED" in (out or "").upper()
+            return (expect == "disabled") == disabled, ("disabled" if disabled else "configured")
+        rc, out = _run_no_shell(["systemctl", "is-active", str(check["name"])], 5)
+        active = (out or "").strip() == "active"
+        enabled_rc, _ = _run_no_shell(["systemctl", "is-enabled", str(check["name"])], 5)
+        if expect == "running":
+            return active, "active" if active else "inactive"
+        if expect == "stopped":
+            return not active, "active" if active else "inactive"
+        if expect == "disabled":
+            return not active and enabled_rc != 0, f"active={active} enabled_rc={enabled_rc}"
+        return active and enabled_rc == 0, f"active={active} enabled_rc={enabled_rc}"
+    if ctype == "exists":
+        return os.path.exists(check["path"]) == bool(check.get("want", True)), check["path"]
+    if ctype == "sshd":
+        got = _sshd_effective(str(check["directive"]))
+        if got is None:
+            return None, "nilai efektif tidak terbaca"
+        return got == str(check.get("expect")).lower(), f"{check['directive']}={got}"
+    return None, f"tipe check tidak dikenal: {ctype}"
+
+def audit_profile(profile_name):
+    if not profile_name or profile_name == "none":
+        return []
+    os_name = "windows" if "windows" in platform.system().lower() else "linux"
+    findings = []
+    for control in _load_profile(os_name):
+        if _profile_na(control.get("na_if")):
+            findings.append({
+                "parameter": control["parameter"],
+                "category": control.get("category", "Hardening Baseline"),
+                "cis_id": control.get("cis_id", ""),
+                "status": "N/A",
+                "details": f"N/A: {control.get('na_reason', control.get('na_if'))}"
+            })
+            continue
+        try:
+            ok, detail = _eval_check(control.get("check") or {})
+        except Exception as exc:
+            ok, detail = None, f"gagal dievaluasi: {exc}"
+        if ok is None:
+            status = "WARNING"
+        elif ok:
+            status = "PASS"
+        else:
+            status = "FAIL" if str(control.get("severity", "medium")).lower() in ("high", "medium") else "WARNING"
+        findings.append({
+            "parameter": control["parameter"],
+            "category": control.get("category", "Hardening Baseline"),
+            "cis_id": " / ".join(filter(None, [control.get("cis_id"), control.get("stig")])),
+            "status": status,
+            "details": f"{detail}. {control.get('mitigation', '')}".strip()
+        })
+    return findings
+
+
+
+# ==============================================================================
 # MAIN FULL AUDIT ORCHESTRATOR
 # ==============================================================================
 def run_full_audit(unit_name="PASOPATI-LOCAL-NODE"):
@@ -669,6 +1137,7 @@ def run_full_audit(unit_name="PASOPATI-LOCAL-NODE"):
     kb = audit_kernel_boot_integrity()
     cs = audit_crypto_storage()
     pb = audit_privilege_boundaries()
+    extra = audit_windows_hardening() if 'windows' in platform.system().lower() else audit_linux_hardening()
     
     crit_open = [p for p in open_ports if p.get('is_critical')]
     exposed = []
@@ -715,6 +1184,8 @@ def run_full_audit(unit_name="PASOPATI-LOCAL-NODE"):
     audit_matrix.extend(kb)
     audit_matrix.extend(cs)
     audit_matrix.extend(pb)
+    audit_matrix.extend(extra)
+    audit_matrix.extend(audit_profile(AUDIT_PROFILE))
     
     for item in audit_matrix:
         detail_val = item.get("details") or item.get("detail", "")
@@ -731,10 +1202,17 @@ def run_full_audit(unit_name="PASOPATI-LOCAL-NODE"):
     
     audit_result = {
         "metadata": {
-            "scanner": "PASOPATI Autonomous Deep Agent v2.6",
+            "scanner": "PASOPATI Autonomous Deep Agent v2.7",
             "timestamp": timestamp,
             "tactical_unit": unit_name,
             "standard_baseline": "CIS Benchmark v8.0, DISA STIG, ISA/IEC 62443 Deep Baseline",
+            "audit_version": "2.7",
+            "profile": {
+                "name": AUDIT_PROFILE,
+                "checks_total": total_items,
+                "applicable": applicable_items,
+                "not_applicable": na_items
+            },
             "quarantine_status": "NORMAL"
         },
         "device_info": {
@@ -823,12 +1301,23 @@ import re as _re
 
 # Direktori backup lokal untuk snapshot pra-perubahan di host.
 def _remediation_backup_dir():
-    path = os.path.join(os.path.expanduser("~"), ".pasopati", "backups")
+    root = os.path.join(os.path.expanduser("~"), ".pasopati")
+    path = os.path.join(root, "backups")
     try:
         os.makedirs(path, mode=0o700, exist_ok=True)
         os.chmod(path, 0o700)
     except Exception:
         pass
+    # os.chmod 0o700 tidak membentuk ACL di Windows; pastikan pemilik sesi
+    # benar-benar bisa membaca file kunci BitLocker setelah proses elevated.
+    if os.name == "nt":
+        user = os.environ.get("USERNAME", "")
+        if user:
+            for d in (root, path):
+                try:
+                    _run_no_shell(["icacls", d, "/grant", user + ":(OI)(CI)F", "/C", "/Q"], 15)
+                except Exception:
+                    pass
     return path
 
 def _comparable_state(state):
@@ -864,6 +1353,233 @@ def _run_no_shell(argv, timeout=10):
         return res.returncode, (res.stdout or "") + (res.stderr or "")
     except Exception as e:
         return -1, str(e)
+
+# --- Preflight jalur akses: cegah operator terkunci di luar host ---
+_ACCESS_RISK_NOTES = {
+    "ports-block-windows": "memblokir RDP 3389 inbound — sesi remote BARU tidak bisa masuk sampai rule dihapus",
+    "ports-block-linux": "memblokir port 21/23/445/4444 via iptables (22 tetap terbuka)",
+    "ssh-disable-root": "root tidak bisa login SSH langsung pada sesi baru",
+    "fw-enable-ufw": "UFW default deny incoming; port 22 diizinkan lebih dulu, tetap sediakan konsol",
+    "fw-enable-defender": "Windows Firewall dinyalakan di semua profil; sesi remote bisa terputus",
+}
+
+def _session_is_remote():
+    if platform.system().lower() == "windows":
+        return str(os.environ.get("SESSIONNAME", "")).upper().startswith("RDP")
+    return bool(os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"))
+
+def _access_preflight(items):
+    """Kembalikan (blocking, catatan). blocking=True bila sesi ini remote dan plan
+    memblokir kanal yang sedang dipakai, sehingga eksekusi butuh konfirmasi."""
+    notes = []
+    blocking = False
+    aliases = {i.get("alias") for i in items if isinstance(i, dict)}
+    remote = _session_is_remote()
+    for alias in sorted(a for a in aliases if a in _ACCESS_RISK_NOTES):
+        notes.append(f"{alias}: {_ACCESS_RISK_NOTES[alias]}")
+        if remote and alias in ("ports-block-windows", "fw-enable-defender"):
+            blocking = True
+    if blocking:
+        notes.append("sesi ini terdeteksi REMOTE — siapkan konsol/KVM atau rollback sebelum lanjut")
+    return blocking, notes
+
+# --- Dead-man timer: rollback otomatis bila operator terputus dan tak konfirmasi ---
+# Dijalankan sebagai proses/jadwal terpisah supaya tetap hidup walau sesi SSH/RDP mati.
+DEFAULT_DEADMAN_SECONDS = 600
+DEADMAN_ENV = "PASOPATI_DEADMAN_SECONDS"
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name) or default)
+    except Exception:
+        return default
+
+def _deadman_confirm_path(plan_id):
+    return os.path.join(_remediation_backup_dir(), f"{plan_id}.confirmed")
+
+def _deadman_task_name(plan_id):
+    return "PASOPATI-DEADMAN-" + str(plan_id)[:60]
+
+def _deadman_shell_script(seconds, confirm, plan_id, backup_dir):
+    python = os.path.abspath(sys.executable or "python3")
+    entry = os.path.abspath(sys.argv[0] or "pasopati_remediate.py")
+    return (
+        "#!/bin/sh\n"
+        f"# Watchdog PASOPATI: rollback otomatis bila tak dikonfirmasi dalam {int(seconds)} detik.\n"
+        f"sleep {int(seconds)}\n"
+        f'if [ -f "{confirm}" ]; then rm -f "{confirm}"; exit 0; fi\n'
+        f'exec "{python}" "{entry}" --deadman-rollback "{plan_id}" "{backup_dir}"\n'
+    )
+
+def _deadman_ps_script(seconds, confirm, plan_id, backup_dir, log_path):
+    python = os.path.abspath(sys.executable or "python")
+    entry = os.path.abspath(sys.argv[0] or "pasopati_remediate.py")
+    def q(value):
+        return "'" + str(value).replace("'", "''") + "'"
+    return (
+        f"Start-Sleep -Seconds {int(seconds)}\n"
+        f"if (Test-Path -LiteralPath {q(confirm)}) {{ Remove-Item -LiteralPath {q(confirm)} -Force; exit 0 }}\n"
+        f"& {q(python)} {q(entry)} --deadman-rollback {q(plan_id)} {q(backup_dir)} *>> {q(log_path)}\n"
+    )
+
+def _deadman_arm(plan_id, seconds):
+    """Pasang watchdog. Kembalikan deskripsi target (path/task) untuk log."""
+    if seconds <= 0:
+        return ""
+    backup_dir = _remediation_backup_dir()
+    confirm = _deadman_confirm_path(plan_id)
+    try:
+        os.remove(confirm)
+    except Exception:
+        pass
+    if platform.system().lower() == "windows":
+        ps = os.path.join(backup_dir, f"{plan_id}_deadman.ps1")
+        log_path = os.path.join(backup_dir, f"{plan_id}_deadman.log")
+        with open(ps, "w") as f:
+            f.write(_deadman_ps_script(seconds, confirm, plan_id, backup_dir, log_path))
+        target = datetime.datetime.now() + datetime.timedelta(seconds=seconds)
+        rc, out = _run_no_shell([
+            "schtasks", "/create", "/f", "/tn", _deadman_task_name(plan_id),
+            "/sc", "once", "/st", target.strftime("%H:%M"), "/sd", target.strftime("%m/%d/%Y"),
+            "/ru", "SYSTEM", "/rl", "HIGHEST",
+            "/tr", f'powershell -NoProfile -ExecutionPolicy Bypass -File "{ps}"'
+        ], 30)
+        if rc != 0:
+            raise RuntimeError((out or "").strip()[:200] or "schtasks gagal")
+        return "task " + _deadman_task_name(plan_id)
+    script = os.path.join(backup_dir, f"{plan_id}_deadman.sh")
+    with open(script, "w") as f:
+        f.write(_deadman_shell_script(seconds, confirm, plan_id, backup_dir))
+    try:
+        os.chmod(script, 0o700)
+    except Exception:
+        pass
+    subprocess.Popen(
+        ["/bin/sh", script],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return script
+
+def _deadman_disarm(plan_id):
+    """Batalkan watchdog (tulis file konfirmasi + hapus task Windows)."""
+    try:
+        with open(_deadman_confirm_path(plan_id), "w") as f:
+            f.write(datetime.datetime.now().isoformat() + "\n")
+    except Exception:
+        pass
+    if platform.system().lower() == "windows":
+        _run_no_shell(["schtasks", "/delete", "/f", "/tn", _deadman_task_name(plan_id)], 20)
+
+def run_deadman_rollback(plan_id, backup_dir):
+    """Mode watchdog: pulihkan seluruh snapshot plan tanpa server/token."""
+    print(f"[DEADMAN] Tidak ada konfirmasi — memulihkan plan {plan_id} dari {backup_dir}")
+    snapshots = sorted(glob.glob(os.path.join(backup_dir, f"{plan_id}_*.json")))
+    failures = 0
+    restored = 0
+    for snap in reversed(snapshots):
+        try:
+            with open(snap, "r") as f:
+                meta = json.load(f)
+        except Exception as exc:
+            print(f"[!] Snapshot tidak terbaca: {snap}: {exc}")
+            failures += 1
+            continue
+        alias = meta.get("alias")
+        entry = ALLOWLIST_ANALISA.get(alias) or {}
+        if "rollback" not in entry:
+            print(f"    lewati {alias} (tanpa handler rollback)")
+            continue
+        pre_state = meta.get("preState")
+        try:
+            entry["rollback"](pre_state)
+            match = _comparable_state(entry["read"]()) == _comparable_state(pre_state)
+        except Exception as exc:
+            print(f"    rollback {alias} gagal: {exc}")
+            match = False
+        restored += 1
+        if not match:
+            failures += 1
+            print(f"    [!] {alias}: state belum kembali ke pre-state")
+        else:
+            print(f"    [OK] {alias} dipulihkan")
+    result = {
+        "planId": plan_id,
+        "at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "snapshots": len(snapshots),
+        "restored": restored,
+        "failures": failures,
+        "status": "ROLLED_BACK" if failures == 0 else "PARTIAL",
+    }
+    try:
+        with open(os.path.join(backup_dir, f"deadman-result-{plan_id}.json"), "w") as f:
+            json.dump(result, f, indent=2)
+    except Exception:
+        pass
+    print(f"[DEADMAN] Selesai: {restored} langkah dipulihkan, {failures} gagal.")
+    return result
+
+# --- Escrow kunci BitLocker ke server (redundansi selain file lokal) ---
+_ESCROW_BASE = ""
+_ESCROW_KEY = ""
+_ESCROW_DEVICE = ""
+# Kredensial host ter-enrol + opsi TLS agent.
+_HOST_KEY = ""
+_CA_CERT = ""
+_INSECURE = False
+
+def _urlopen(req, timeout=8):
+    context = None
+    if _INSECURE:
+        context = ssl._create_unverified_context()
+    elif _CA_CERT:
+        context = ssl.create_default_context(cafile=_CA_CERT)
+    return urllib.request.urlopen(req, timeout=timeout, context=context)
+
+def _auth_headers():
+    headers = {}
+    if _HOST_KEY:
+        headers["X-Pasopati-Host-Key"] = _HOST_KEY
+    return headers
+
+def _escrow_push(kind, value):
+    if not (_ESCROW_BASE and (_ESCROW_KEY or _HOST_KEY) and value):
+        return False
+    try:
+        body = json.dumps({"deviceId": _ESCROW_DEVICE, "kind": kind, "value": value}).encode("utf-8")
+        headers = {"Content-Type": "application/json", **_auth_headers()}
+        if _ESCROW_KEY:
+            headers["X-Pasopati-API-Key"] = _ESCROW_KEY
+        req = urllib.request.Request(_ESCROW_BASE + "/api/escrow", data=body, headers=headers, method="POST")
+        with _urlopen(req, 8) as resp:
+            return 200 <= resp.getcode() < 300
+    except Exception as exc:
+        print(f"    [!] Escrow ke server gagal ({kind}): {exc}")
+        return False
+
+# --- Persistensi firewall (rule harus bertahan setelah reboot) ---
+def _firewall_persist_supported():
+    if shutil.which("netfilter-persistent"):
+        return True
+    return bool(shutil.which("iptables-save")) and os.path.isdir("/etc/iptables")
+
+def _firewall_persist():
+    if shutil.which("netfilter-persistent"):
+        rc, out = _run_no_shell(["netfilter-persistent", "save"], 20)
+        return rc == 0, (out or "").strip()[:200]
+    if shutil.which("iptables-save") and os.path.isdir("/etc/iptables"):
+        rc, out = _run_no_shell(["sh", "-c", "iptables-save > /etc/iptables/rules.v4"], 20)
+        return rc == 0, (out or "").strip()[:200]
+    return False, "netfilter-persistent/iptables-save tidak tersedia"
+
+def _firewall_persisted(ports):
+    if not ports:
+        return True
+    text = _read_text("/etc/iptables/rules.v4") or ""
+    if not text:
+        return False
+    return all(f"--dport {p} -j DROP" in text for p in ports)
 
 # --- Windows: Windows Defender Firewall ---
 _FW_ON = ("ON", "AKTIF", "AAN")
@@ -1231,11 +1947,54 @@ def _win_uac_rollback(pre):
 def _win_ps(cmd, timeout=20):
     return _run_no_shell(["powershell", "-NoProfile", "-Command", cmd], timeout)
 
+# Windows menolak BitLocker pada volume OS tanpa TPM (0x8028400F) kecuali policy
+# ini mengizinkannya. Nilai ini yang dipasang gpedit "Require additional
+# authentication at startup" + "Allow BitLocker without a compatible TPM".
+# Keempat opsi TPM harus "Allow" (2): kombinasi "Do not allow" semuanya
+# memicu 0x8031005B (policy startup options in conflict).
+_FVE_POLICY_KEY = r"HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\FVE"
+_FVE_NO_TPM_VALUES = {
+    "EnableBdeWithNoTPM": 1,
+    "UseAdvancedStartup": 1,
+    "UseTPM": 2,
+    "UseTPMPIN": 2,
+    "UseTPMKey": 2,
+    "UseTPMKeyPIN": 2,
+}
+
+def _fve_policy_state():
+    """Snapshot nilai policy FVE yang kita ubah; None berarti belum ada."""
+    rc, out = _run_no_shell(["reg", "query", _FVE_POLICY_KEY], 10)
+    text = out or ""
+    state = {}
+    for name in _FVE_NO_TPM_VALUES:
+        m = _re.search(r"\b" + name + r"\s+REG_DWORD\s+(0x[0-9a-fA-F]+|\d+)", text)
+        state[name] = int(m.group(1), 0) if m else None
+    return state
+
+def _fve_policy_apply_no_tpm():
+    prev = _fve_policy_state()
+    for name, val in _FVE_NO_TPM_VALUES.items():
+        _run_no_shell(["reg", "add", _FVE_POLICY_KEY, "/v", name, "/t", "REG_DWORD", "/d", str(val), "/f"], 10)
+    return prev
+
+def _fve_policy_restore(prev):
+    if not isinstance(prev, dict):
+        return
+    for name, old in prev.items():
+        if name not in _FVE_NO_TPM_VALUES:
+            continue
+        if old is None:
+            _run_no_shell(["reg", "delete", _FVE_POLICY_KEY, "/v", name, "/f"], 10)
+        else:
+            _run_no_shell(["reg", "add", _FVE_POLICY_KEY, "/v", name, "/t", "REG_DWORD", "/d", str(old), "/f"], 10)
+
 def _win_bitlocker_state():
     """Baca status via PowerShell (JSON stabil, tidak bergantung lokalisasi/manage-bde)."""
     cmd = (
         "$v=Get-BitLockerVolume -MountPoint 'C:' -ErrorAction Stop; "
         "@{p=[string]$v.ProtectionStatus; e=[int]$v.EncryptionPercentage; "
+        "s=[string]$v.VolumeStatus; "
         "k=@($v.KeyProtector | ForEach-Object { [string]$_.KeyProtectorType }); "
         "r=@($v.KeyProtector | Where-Object { $_.KeyProtectorType -eq 'RecoveryPassword' } | "
         "ForEach-Object { [string]$_.RecoveryPassword })} | ConvertTo-Json -Compress"
@@ -1244,21 +2003,32 @@ def _win_bitlocker_state():
     try:
         data = json.loads((out or "").strip().splitlines()[-1])
         protection = str(data.get("p", "")).strip().lower()
+        pct = int(data.get("e", 0) or 0)
         return {
             "protectionOn": protection in ("on", "1", "true"),
-            "encrypted": int(data.get("e", 0)) >= 100,
+            "protectionStatus": str(data.get("p", "")),
+            "volumeStatus": str(data.get("s", "")),
+            "encrypted": pct >= 100,
+            "encryptionPercentage": pct,
             "protectors": list(data.get("k") or []),
             "recoveryKeys": [k for k in (data.get("r") or []) if k],
+            "fve": _fve_policy_state(),
         }
     except Exception:
         rc2, raw = _run_no_shell(["manage-bde", "-status", "C:"], 10)
         low = raw or ""
+        m = _re.search(r"Percentage Encrypted:\s*([0-9.]+)%", low)
         return {
             "protectionOn": ("Protection On" in low) or ("Perlindungan Aktif" in low),
+            "protectionStatus": "On" if ("Protection On" in low or "Perlindungan Aktif" in low) else "Off",
+            "volumeStatus": "FullyEncrypted" if "Fully Encrypted" in low else (
+                "EncryptionInProgress" if "Encryption In Progress" in low else "FullyDecrypted"),
             "encrypted": "100.0%" in low,
+            "encryptionPercentage": float(m.group(1)) if m else 0.0,
             "protectors": [],
             "recoveryKeys": [],
             "raw": low[:300],
+            "fve": _fve_policy_state(),
         }
 
 def _win_tpm_ready():
@@ -1266,21 +2036,65 @@ def _win_tpm_ready():
         "try { $t=Get-Tpm; if ($t.TpmPresent -and $t.TpmReady) { 'yes' } else { 'no' } } catch { 'no' }", 15)
     return "yes" in (out or "").lower()
 
+def _win_bitlocker_boot_password(length=20):
+    """Password boot BitLocker harus ANGKA saja.
+
+    Layar pre-boot memakai layout keyboard dasar; karakter seperti '_' atau '-'
+    (hasil token_urlsafe) sering tidak bisa diketik dan membuat volume tidak
+    bisa dibuka. Kasus lapangan 2026-11-14: password berisi '_' ditolak di
+    layar "Enter the password to unlock this drive".
+    """
+    return "".join(secrets.choice("0123456789") for _ in range(length))
+
 def _win_bitlocker_add_protector(kind, timeout=20):
     if kind == "recovery":
         return _win_ps("Add-BitLockerKeyProtector -MountPoint 'C:' -RecoveryPasswordProtector | Out-Null", timeout)
     if kind == "tpm":
         return _win_ps("Add-BitLockerKeyProtector -MountPoint 'C:' -TpmProtector | Out-Null", timeout)
-    pw = secrets.token_urlsafe(18)
+    pw = _win_bitlocker_boot_password()
     rc, out = _win_ps(
         "$p=ConvertTo-SecureString '" + pw + "' -AsPlainText -Force; "
         "Add-BitLockerKeyProtector -MountPoint 'C:' -PasswordProtector -Password $p | Out-Null", timeout)
     return rc, out, pw
 
+def _win_bitlocker_ok(st):
+    """Enkripsi dianggap berhasil bila proteksi On, atau enkripsi sudah berjalan
+    dengan protector aman. Proteksi bisa tetap Off selama konversi berlangsung
+    dan baru On setelah enkripsi selesai/reboot."""
+    if not isinstance(st, dict):
+        return False
+    if st.get("protectionOn") or st.get("encrypted"):
+        return True
+    status = str(st.get("volumeStatus") or "").lower()
+    if "decryption" in status:
+        return False
+    pct = st.get("encryptionPercentage") or 0
+    secure = any(p in ("Password", "RecoveryPassword", "Tpm", "TpmPin", "StartupKey")
+                 for p in (st.get("protectors") or []))
+    return pct > 0 and secure
+
 def _win_bitlocker_apply():
     st = _win_bitlocker_state()
     if st.get("protectionOn"):
         return {"exitCode": 0, "output": "BitLocker sudah aktif (idempoten)", "recoveryKey": ""}
+
+    pct = st.get("encryptionPercentage") or 0
+    status = str(st.get("volumeStatus") or "").lower()
+    if "decryption" in status:
+        return {"exitCode": 1,
+                "output": ("dekripsi BitLocker masih berjalan; tunggu sampai "
+                           "Fully Decrypted sebelum mengaktifkan ulang"),
+                "recoveryKey": ""}
+    if pct > 0 and not st.get("encrypted"):
+        # Enkripsi sudah berjalan (lanjutan run sebelumnya). Jangan menerbitkan
+        # password baru; cukup nyalakan proteksi dan laporkan state sebenarnya.
+        _win_ps("Resume-BitLocker -MountPoint 'C:' -ErrorAction Stop | Out-Null", 20)
+        st = _win_bitlocker_wait_ready(30)
+        keys = st.get("recoveryKeys") or []
+        return {"exitCode": 0 if _win_bitlocker_ok(st) else 1,
+                "output": (f"enkripsi BitLocker sudah berjalan ({pct}%); "
+                           "proteksi menyala setelah enkripsi/reboot"),
+                "recoveryKey": keys[-1] if keys else ""}
 
     protectors = st.get("protectors") or []
     tpm_ready = _win_tpm_ready()
@@ -1292,6 +2106,7 @@ def _win_bitlocker_apply():
     if st.get("encrypted"):
         # Volume sudah terenkripsi → pastikan ada protector yang bisa membuka, lalu resume.
         if not tpm_ready and "Password" not in protectors:
+            _fve_policy_apply_no_tpm()
             rc_pw, _out_pw, boot_pw = _win_bitlocker_add_protector("password")
             if rc_pw != 0:
                 boot_pw = None
@@ -1309,23 +2124,55 @@ def _win_bitlocker_apply():
                 "Enable-BitLocker -MountPoint 'C:' -EncryptionMethod XtsAes256 "
                 "-TpmProtector -RecoveryPasswordProtector -SkipHardwareTest -ErrorAction Stop | Out-Null", 30)
         else:
-            boot_pw = secrets.token_urlsafe(18)
-            rc, out = _win_ps(
+            # Volume OS tanpa TPM ditolak Windows (0x8028400F) kecuali policy
+            # "Allow BitLocker without a compatible TPM" dipasang lebih dulu.
+            _fve_policy_apply_no_tpm()
+            boot_pw = _win_bitlocker_boot_password()
+            enable_cmd = (
                 "$p=ConvertTo-SecureString '" + boot_pw + "' -AsPlainText -Force; "
                 "Enable-BitLocker -MountPoint 'C:' -EncryptionMethod XtsAes256 "
-                "-PasswordProtector -Password $p -SkipHardwareTest -ErrorAction Stop | Out-Null", 30)
+                "-PasswordProtector -Password $p -SkipHardwareTest -ErrorAction Stop | Out-Null")
+            rc, out = _win_ps(enable_cmd, 30)
+            if rc != 0 and ("0x8028400F" in (out or "") or "0x8031005B" in (out or "") or "TPM" in (out or "")):
+                # Policy baru kadang belum terbaca sampai Group Policy refresh.
+                _win_ps("gpupdate /target:computer /force | Out-Null", 120)
+                rc, out = _win_ps(enable_cmd, 30)
             if rc == 0:
                 _win_bitlocker_add_protector("recovery")
         if rc != 0:
-            return {"exitCode": 1, "output": "enable gagal: " + (out or "")[:300], "recoveryKey": ""}
+            keys = (_win_bitlocker_state().get("recoveryKeys") or [])
+            res = {"exitCode": 1, "output": "enable gagal: " + (out or "")[:300],
+                   "recoveryKey": keys[-1] if keys else ""}
+            if boot_pw:
+                # Password sudah dipasang ke volume: jangan pernah hilangkan.
+                res["bootPassword"] = boot_pw
+            return res
 
-    st = _win_bitlocker_state()
+    st = _win_bitlocker_wait_ready()
     if not st.get("protectionOn") and not st.get("encrypted"):
-        return {"exitCode": 1, "output": "enkripsi tidak terdeteksi aktif setelah perintah", "recoveryKey": ""}
+        # Enkripsi bisa berjalan dengan proteksi masih tersuspend.
+        rc_r, _out_r = _win_ps("Resume-BitLocker -MountPoint 'C:' -ErrorAction Stop | Out-Null", 20)
+        if rc_r != 0:
+            _win_ps("manage-bde -protectors -enable C:", 20)
+        st = _win_bitlocker_wait_ready(30)
+    if not _win_bitlocker_ok(st):
+        pct = st.get("encryptionPercentage")
+        keys = st.get("recoveryKeys") or []
+        res = {"exitCode": 1,
+               "output": ("proteksi/enkripsi tidak aktif setelah perintah "
+                          f"(pct={pct}, status={st.get('protectionStatus')}, "
+                          f"volume={st.get('volumeStatus')}, "
+                          f"protectors={st.get('protectors')})"),
+               "recoveryKey": keys[-1] if keys else ""}
+        if boot_pw:
+            res["bootPassword"] = boot_pw
+        return res
     keys = st.get("recoveryKeys") or []
+    pct = st.get("encryptionPercentage") or 0
     res = {
-        "exitCode": 0 if st.get("protectionOn") else 1,
-        "output": "proteksi BitLocker aktif" if st.get("protectionOn") else "proteksi belum aktif",
+        "exitCode": 0,
+        "output": ("proteksi BitLocker aktif" if st.get("protectionOn") else
+                   f"enkripsi BitLocker berjalan ({pct}%); proteksi menyala setelah enkripsi/reboot"),
         "recoveryKey": keys[-1] if keys else "",
     }
     if boot_pw:
@@ -1333,17 +2180,44 @@ def _win_bitlocker_apply():
     return res
 
 def _win_bitlocker_verify():
-    return _win_bitlocker_state().get("protectionOn") is True
+    return _win_bitlocker_ok(_win_bitlocker_state())
+
+def _win_bitlocker_wait_ready(timeout=45, interval=4):
+    """Enable-BitLocker kembali sebelum status volume ter-update; tunggu sampai
+    proteksi On atau enkripsi mulai berjalan."""
+    deadline = time.time() + timeout
+    st = _win_bitlocker_state()
+    while time.time() < deadline:
+        if st.get("protectionOn") or st.get("encrypted") or (st.get("encryptionPercentage") or 0) > 0:
+            return st
+        time.sleep(interval)
+        st = _win_bitlocker_state()
+    return st
+
+def _win_bitlocker_rollback_state():
+    # Dekripsi berjalan di background: cukup bandingkan status proteksi, bukan
+    # persentase enkripsi, agar rollback tidak selalu dilaporkan gagal.
+    return {"protectionOn": _win_bitlocker_state().get("protectionOn")}
+
 def _win_bitlocker_rollback(pre):
+    def _restore_policy(res):
+        if isinstance(pre, dict):
+            _fve_policy_restore(pre.get("fve"))
+        return res
     # Aktif sebelum remediasi → biarkan aktif.
     if isinstance(pre, dict) and pre.get("protectionOn") is True:
-        return {"exitCode": 0, "output": "BitLocker sudah aktif sebelum remediasi; dibiarkan aktif"}
+        return _restore_policy({"exitCode": 0, "output": "BitLocker sudah aktif sebelum remediasi; dibiarkan aktif"})
     # Sudah terenkripsi tapi proteksi mati → suspend, jangan dekripsi (lama).
     if isinstance(pre, dict) and pre.get("encrypted") is True:
         rc, out = _win_ps("Suspend-BitLocker -MountPoint 'C:' -Force | Out-Null", 20)
-        return {"exitCode": rc, "output": ("proteksi disuspend (tetap terenkripsi). " + out[:150]) if rc == 0 else out}
-    rc, out = _run_no_shell(["manage-bde", "-off", "C:"], 15)
-    return {"exitCode": rc, "output": out}
+        return _restore_policy({"exitCode": rc, "output": ("proteksi disuspend (tetap terenkripsi). " + out[:150]) if rc == 0 else out})
+    rc, out = _run_no_shell(["manage-bde", "-off", "C:"], 120)
+    # Password acak yang dibuat remediasi tidak diketahui operator; hapus agar
+    # tidak tertinggal sebagai protector yang tak bisa dipakai. RecoveryPassword
+    # (kunci yang sudah di-escrow) sengaja dibiarkan sampai dekripsi selesai.
+    if isinstance(pre, dict) and "Password" not in (pre.get("protectors") or []):
+        _run_no_shell(["manage-bde", "-protectors", "-delete", "C:", "-type", "Password"], 30)
+    return _restore_policy({"exitCode": rc, "output": (out or "")[:300] + " (dekripsi dapat berjalan di background)"})
 
 # --- Linux: GRUB config permissions (CIS 1.4.1) ---
 _GRUB_PATHS = ['/boot/grub/grub.cfg', '/boot/grub2/grub.cfg']
@@ -1379,15 +2253,85 @@ def _linux_grub_rollback(pre):
     return {"exitCode": 0 if not errors else -1, "output": "; ".join(errors) or "izin grub dipulihkan"}
 
 # --- Linux: sudoers NOPASSWD (CIS 5.3.4) ---
+# Aturan keamanan jalur ini:
+#  1. Validasi sintaks `visudo -c -f` pada salinan sementara SEBELUM mengganti
+#     berkas asli (berkas sudoers rusak = sudo mati).
+#  2. Tulis atomik (tmp + os.replace) agar tidak pernah setengah jadi.
+#  3. Berkas cloud-init (`90-cloud-init-users`) tidak dicabut bila user-nya
+#     belum punya password — pada image cloud, mencabut NOPASSWD membuat sudo
+#     langsung tidak terpakai.
 def _sudoers_files():
     files = ['/etc/sudoers']
     d = '/etc/sudoers.d'
     if os.path.isdir(d):
         for name in sorted(os.listdir(d)):
             p = os.path.join(d, name)
-            if os.path.isfile(p) and not name.endswith(('~', '.bak', '.tmp')):
+            if os.path.isfile(p) and not name.endswith(('~', '.bak', '.tmp', '.pasopati.tmp')):
                 files.append(p)
     return [p for p in files if os.path.isfile(p)]
+
+_CLOUD_INIT_SUDOERS = '90-cloud-init-users'
+
+def _sudoers_validate(path):
+    """Validasi sintaks sudoers. True bila valid atau visudo tidak tersedia."""
+    rc, out = _run_no_shell(["visudo", "-c", "-f", path], 15)
+    if rc == -1:
+        return True, "visudo tidak tersedia (validasi dilewati)"
+    return rc == 0, (out or "").strip()[:300]
+
+def _sudoers_write(path, content, mode, force=False):
+    """Tulis atomik + validasi. force=True tetap mengganti walau visudo menolak (rollback)."""
+    tmp = path + ".pasopati.tmp"
+    with open(tmp, "w") as f:
+        f.write(content)
+    try:
+        os.chmod(tmp, mode)
+    except Exception:
+        pass
+    ok, msg = _sudoers_validate(tmp)
+    if not ok and not force:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return False, msg
+    # Windows menolak replace bila target read-only (sudoers 0440/0444) — buka dulu.
+    try:
+        if os.path.exists(path):
+            os.chmod(path, 0o600)
+    except Exception:
+        pass
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, mode)
+    except Exception:
+        pass
+    return ok, msg
+
+def _account_has_no_password(spec):
+    """True bila subjek sudoers (user/grup) ada dan belum punya password."""
+    name = spec.lstrip('%+')
+    if not name or name.startswith('#'):
+        return False
+    rc, out = _run_no_shell(["passwd", "-S", name], 5)
+    if rc != 0:
+        return False
+    parts = (out or "").split()
+    return len(parts) >= 2 and parts[1] in ("L", "NP", "*L")
+
+def _sudoers_cloud_init_exempt(path, content):
+    """Subjek pada berkas cloud-init yang belum punya password (aman dipertahankan)."""
+    if os.path.basename(path) != _CLOUD_INIT_SUDOERS:
+        return []
+    exempt = []
+    for line in (content or "").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#') or 'NOPASSWD:' not in stripped:
+            continue
+        subject = stripped.split()[0]
+        if _account_has_no_password(subject):
+            exempt.append(subject)
+    return exempt
 def _linux_sudoers_state():
     entries = {}
     for p in _sudoers_files():
@@ -1403,25 +2347,45 @@ def _linux_sudoers_apply():
     st = _linux_sudoers_state()
     if st["clean"]:
         return {"exitCode": 0, "output": "tidak ada NOPASSWD; tidak ada perubahan"}
-    errors = []
-    for p in st["files"]:
+    replaced, notes, errors = [], [], []
+    for p, meta in st["files"].items():
+        content = meta.get("content", "")
+        exempt = _sudoers_cloud_init_exempt(p, content)
+        if exempt:
+            notes.append("%s: NOPASSWD dipertahankan untuk %s (belum punya password)" % (p, ", ".join(exempt)))
+            continue
+        new_content = "\n".join(
+            line.replace("NOPASSWD:", "") if not line.strip().startswith('#') else line
+            for line in content.splitlines()
+        ) + "\n"
         try:
-            mode = os.stat(p).st_mode
-            os.chmod(p, mode | 0o200)
-            with open(p, 'r', errors='ignore') as f:
-                content = f.read()
-            new_content = "\n".join(
-                line.replace("NOPASSWD:", "") if not line.strip().startswith('#') else line
-                for line in content.splitlines()
-            ) + "\n"
-            with open(p, 'w') as f:
-                f.write(new_content)
-            os.chmod(p, mode)
+            mode = int(meta.get("mode") or "440", 8)
+            ok, msg = _sudoers_write(p, new_content, mode)
         except Exception as e:
-            errors.append(f"{p}: {e}")
-    return {"exitCode": 0 if not errors else -1, "output": "; ".join(errors) or "NOPASSWD dihapus dari sudoers"}
+            ok, msg = False, str(e)
+        if ok:
+            replaced.append({"path": p, "content": content, "mode": meta.get("mode")})
+        else:
+            errors.append("%s: %s" % (p, msg))
+    if errors:
+        # Satu berkas gagal divalidasi → kembalikan yang sudah diganti, jangan separuh jalan.
+        for item in reversed(replaced):
+            try:
+                _sudoers_write(item["path"], item["content"], int(item["mode"] or "440", 8), force=True)
+            except Exception:
+                pass
+        return {"exitCode": -1, "output": "visudo menolak; seluruh perubahan dibatalkan. " + "; ".join(errors)[:400]}
+    output = "NOPASSWD dihapus dari %d berkas" % len(replaced) if replaced else "tidak ada berkas yang diubah"
+    if notes:
+        output += " | " + "; ".join(notes)
+    return {"exitCode": 0, "output": output[:600]}
+
 def _linux_sudoers_verify():
-    return _linux_sudoers_state()["clean"] is True
+    for p, meta in _linux_sudoers_state()["files"].items():
+        if not _sudoers_cloud_init_exempt(p, meta.get("content", "")):
+            return False
+    return True
+
 def _linux_sudoers_rollback(pre):
     files = pre.get("files") if isinstance(pre, dict) else None
     if not files:
@@ -1429,13 +2393,9 @@ def _linux_sudoers_rollback(pre):
     errors = []
     for p, meta in files.items():
         try:
-            mode = os.stat(p).st_mode
-            os.chmod(p, mode | 0o200)
-            with open(p, 'w') as f:
-                f.write(meta.get("content", ""))
-            os.chmod(p, int(meta["mode"], 8) if meta.get("mode") else mode)
+            _sudoers_write(p, meta.get("content", ""), int(meta.get("mode") or "440", 8), force=True)
         except Exception as e:
-            errors.append(f"{p}: {e}")
+            errors.append("%s: %s" % (p, e))
     return {"exitCode": 0 if not errors else -1, "output": "; ".join(errors) or "sudoers dipulihkan dari snapshot"}
 
 # --- Linux: SUID pada binari kritis (CIS 1.1.21) ---
@@ -1536,7 +2496,14 @@ def _linux_ports_state():
         if f":{port} " in out or f":{port}\n" in out:
             listening.append(port)
     blocked = [p for p, _l in _LINUX_CRIT_PORTS if _linux_port_rule_exists(p)]
-    return {"listening": listening, "blocked": blocked, "open": [p for p in listening if p not in blocked]}
+    supported = _firewall_persist_supported()
+    return {
+        "listening": listening,
+        "blocked": blocked,
+        "open": [p for p in listening if p not in blocked],
+        "persistSupported": supported,
+        "persisted": _firewall_persisted(blocked) if supported else None,
+    }
 
 def _linux_ports_apply():
     st = _linux_ports_state()
@@ -1546,11 +2513,24 @@ def _linux_ports_apply():
             rc, out = _run_no_shell(["iptables", "-A", "INPUT", "-p", "tcp", "--dport", str(port), "-j", "DROP"], 10)
             if rc != 0:
                 errors.append(f"{port}: {out[:120]}")
-    return {"exitCode": 0 if not errors else -1, "output": "; ".join(errors) or f"port diblokir: {st['open']}"}
+    notes = []
+    if st["open"] and st.get("persistSupported"):
+        ok, msg = _firewall_persist()
+        if ok:
+            notes.append("rule dipersistenkan")
+        else:
+            notes.append(f"PERSISTENSI GAGAL: {msg}")
+    elif st["open"]:
+        notes.append("persistensi firewall tidak tersedia — rule hilang setelah reboot")
+    summary = "; ".join(notes)
+    return {"exitCode": 0 if not errors else -1, "output": ("; ".join(errors) + " | " if errors else "") + summary or f"port diblokir: {st['open']}"}
 
 def _linux_ports_verify():
     st = _linux_ports_state()
-    return all(p in st["blocked"] for p in st["listening"])
+    if not all(p in st["blocked"] for p in st["listening"]):
+        return False
+    # Bila mekanisme persistensi ada, rule wajib ikut tersimpan.
+    return st.get("persisted") is not False
 
 def _linux_ports_rollback(pre):
     ports = pre.get("open") if isinstance(pre, dict) else None
@@ -1561,7 +2541,11 @@ def _linux_ports_rollback(pre):
         rc, out = _run_no_shell(["iptables", "-D", "INPUT", "-p", "tcp", "--dport", str(port), "-j", "DROP"], 10)
         if rc != 0:
             errors.append(f"{port}: {out[:120]}")
-    return {"exitCode": 0 if not errors else -1, "output": "; ".join(errors) or "rule blokir dihapus"}
+    if _firewall_persist_supported():
+        ok, msg = _firewall_persist()
+        if not ok:
+            errors.append(f"persistensi: {msg}")
+    return {"exitCode": 0 if not errors else -1, "output": "; ".join(errors) or "rule blokir dihapus & dipersistenkan"}
 
 def _win_port_rule_exists(port):
     rc, _out = _win_ps(
@@ -1704,7 +2688,7 @@ ALLOWLIST_ANALISA = {
     "bitlocker-enable": {
         "os": "windows", "risk": "HIGH", "reversible": True,
         "read": _win_bitlocker_state, "apply": _win_bitlocker_apply, "verify": _win_bitlocker_verify,
-        "rollback": _win_bitlocker_rollback
+        "rollback": _win_bitlocker_rollback, "rollback_state": _win_bitlocker_rollback_state
     },
     "grub-config-perms": {
         "os": "linux", "risk": "LOW", "reversible": True,
@@ -1753,6 +2737,24 @@ ALLOWLIST_ANALISA = {
         "read": _admins_state, "verify": _admins_verify, "advisory": True
     }
 }
+
+def print_aliases_by_os():
+    """Cetak alias remediasi dipisah per OS (sumber tunggal: ALLOWLIST_ANALISA)."""
+    order = ("windows", "linux", "any")
+    groups = {name: [] for name in order}
+    for alias, entry in ALLOWLIST_ANALISA.items():
+        groups.setdefault(entry.get("os", "any"), []).append(alias)
+    for name in order:
+        names = sorted(groups.get(name, []))
+        print(f"[{name}] {len(names)} alias")
+        for alias in names:
+            risk = ALLOWLIST_ANALISA[alias].get("risk", "-")
+            tag = " advisory" if alias in ADVISORY_ALIASES else ""
+            print(f"  - {alias} ({risk}{tag})")
+        print()
+    print("[i] Plan hanya boleh berisi alias satu OS (+ alias 'any').")
+    print("[i] Alias Linux ditolak agent Windows dan sebaliknya.")
+
 # ==============================================================================
 # RUN REMEDIATION — validasi token → backup → apply → verifikasi → evidence
 # ==============================================================================
@@ -1785,12 +2787,12 @@ def _fetch_remediation_plan(server_url, plan_id, api_key):
     if not base:
         raise RuntimeError("--server wajib diisi untuk mengambil plan.")
     url = f"{base}/api/remediation-plans/{urllib.parse.quote(plan_id, safe='')}/agent"
-    headers = {"User-Agent": "PASOPATI-Agent/2.5"}
+    headers = {"User-Agent": "PASOPATI-Agent/2.5", **_auth_headers()}
     if api_key:
         headers["X-Pasopati-API-Key"] = api_key
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with _urlopen(req, 10) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="ignore"))
     except urllib.error.HTTPError as exc:
         # Tampilkan alasan dari server (mis. 409 plan belum disetujui / sudah terminal).
@@ -1807,13 +2809,17 @@ def _fetch_remediation_plan(server_url, plan_id, api_key):
     return plan, token
 
 
-def _push_remediation_evidence(server_url, api_key, plan_id, nonce, to_status, evidence, hmac_key=None):
+def _push_remediation_evidence(server_url, api_key, plan_id, nonce, to_status, evidence, hmac_key=None, post_audit=None):
+    payload = {"planId": plan_id, "nonce": nonce, "toStatus": to_status, "evidence": evidence}
+    if post_audit:
+        payload["postAudit"] = post_audit
     url = server_url.rstrip("/") + "/api/remediation-verify"
-    body = json.dumps({"planId": plan_id, "nonce": nonce, "toStatus": to_status, "evidence": evidence}).encode("utf-8")
+    body = json.dumps(payload).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
         "User-Agent": "PASOPATI-Agent/2.6",
-        **({"X-Pasopati-API-Key": api_key} if api_key else {})
+        **({"X-Pasopati-API-Key": api_key} if api_key else {}),
+        **_auth_headers()
     }
     if hmac_key:
         # Evidence ditandatangani HMAC atas raw body, sama seperti telemetri ingest.
@@ -1821,7 +2827,7 @@ def _push_remediation_evidence(server_url, api_key, plan_id, nonce, to_status, e
             hmac_key.encode("utf-8"), body, hashlib.sha256).hexdigest()
         headers["X-Pasopati-Timestamp"] = str(int(time.time()))
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=8) as response:
+    with _urlopen(req, 8) as response:
         return response.getcode()
 
 def _is_elevated():
@@ -2099,6 +3105,20 @@ def _demo_auto_plan():
     return {"planId": "DEMO-AUTO", "deviceId": "DEMO-NODE", "items": filtered}
 
 def run_remediation(args):
+    global _ESCROW_BASE, _ESCROW_KEY, _ESCROW_DEVICE, _HOST_KEY, _CA_CERT, _INSECURE
+    _ESCROW_BASE = (getattr(args, "push_url", None) or "").rstrip("/")
+    if _ESCROW_BASE.endswith("/api/ingest"):
+        _ESCROW_BASE = _ESCROW_BASE[: -len("/api/ingest")]
+    _ESCROW_KEY = getattr(args, "remediate_api_key", "") or ""
+    _HOST_KEY = getattr(args, "host_key", "") or os.environ.get("PASOPATI_HOST_KEY", "")
+    _CA_CERT = getattr(args, "ca_cert", "") or ""
+    _INSECURE = bool(getattr(args, "insecure", False))
+    if _HOST_KEY:
+        print("[*] Kredensial host ter-enrol dipakai (X-Pasopati-Host-Key).")
+        if _ESCROW_BASE.startswith("http://"):
+            print("[i] Koneksi masih plaintext http:// — host key terlihat di jaringan.")
+    if _INSECURE:
+        print("[i] Verifikasi TLS dimatikan (--insecure).")
     plan_path = args.remediate_plan
     if getattr(args, "plan_id", None) and not plan_path:
         try:
@@ -2147,6 +3167,13 @@ def run_remediation(args):
             print(f"[!] Alias '{alias}' hanya untuk OS {entry['os']} — host ini {current_os}.")
             return
 
+    access_blocking, access_notes = _access_preflight(items)
+    if access_notes:
+        print("[!] ==================== PERINGATAN JALUR AKSES ====================")
+        for note in access_notes:
+            print(f"    - {note}")
+        print("[!] ===============================================================")
+
     if getattr(args, "demo", False):
         print("[*] Mode DEMO: melewati validasi token (hanya untuk presentasi/demo).")
         if not args.no_exec and not _is_elevated():
@@ -2177,15 +3204,54 @@ def run_remediation(args):
     if not args.no_exec and not args.push_url and getattr(args, "demo", False):
         print("[*] Mode DEMO tanpa --push-url: evidence hanya dicetak di terminal (tidak dikirim).")
 
+    if access_blocking and not args.no_exec and not getattr(args, "force_access_risk", False):
+        print("[!] Eksekusi DITAHAN: plan memblokir akses remote yang sedang dipakai.")
+        print("    Punya konsol/KVM/IPMI? Ulangi dengan --force-access-risk.")
+        print("    Ingin meninjau dulu tanpa perubahan? Tambahkan --no-exec.")
+        return
+
     print(f"[*] Rencana {plan_id}: {len(items)} tindakan. Mode: {'--no-exec (tanpa perubahan)' if args.no_exec else 'EKSEKUSI AKTUAL'}")
+
+    _ESCROW_DEVICE = str(plan.get("deviceId") or "UNKNOWN")
+    if getattr(args, "host_id", None):
+        print(f"[*] Host ID: {args.host_id}")
+
+    deadman_seconds = int(getattr(args, "deadman_seconds", 0) or 0)
+    if not args.no_exec and deadman_seconds > 0 and any(
+        not ALLOWLIST_ANALISA[i["alias"]].get("advisory") for i in items
+    ):
+        try:
+            target = _deadman_arm(plan_id, deadman_seconds)
+            print(f"[*] DEAD-MAN AKTIF: rollback otomatis dalam {deadman_seconds} dtk bila tidak dikonfirmasi.")
+            print(f"    target: {target}")
+        except Exception as exc:
+            print(f"[!] Dead-man gagal dipasang: {exc}")
 
     backup_meta = []
     evidence = []
     evidence_by_step = {}
     to_status = "VERIFIED"
+
+    # --resume: lanjutkan plan EXECUTING yang terputus tanpa mengulang langkah
+    # yang sudah terverifikasi. Bukti lama ikut dibawa agar cakupan tetap lengkap.
+    resume = bool(getattr(args, "resume", False))
+    if resume:
+        aliases_in_plan = {i.get("alias") for i in items}
+        for prior in (plan.get("evidence") or []):
+            if not isinstance(prior, dict) or prior.get("alias") not in aliases_in_plan:
+                continue
+            if int(prior.get("exitCode") or 0) == 0 and (prior.get("verified") is True or prior.get("advisory") is True):
+                evidence.append(prior)
+        if evidence:
+            print(f"[*] RESUME: {len(evidence)} langkah sudah terverifikasi, dilewati.")
+    done_aliases = {e.get("alias") for e in evidence}
+
     for idx, item in enumerate(items):
         alias = item["alias"]
         entry = ALLOWLIST_ANALISA[alias]
+        if resume and alias in done_aliases:
+            print(f"  [{idx+1}/{len(items)}] {alias} | dilewati (sudah terverifikasi)")
+            continue
         pre_state = entry["read"]()
         print(f"  [{idx+1}/{len(items)}] {alias} | pre-state: {json.dumps(pre_state)[:160]}")
         if args.no_exec:
@@ -2201,6 +3267,7 @@ def run_remediation(args):
                 "alias": alias,
                 "exitCode": 0,
                 "outputHash": _hash_state(pre_state),
+                "preStateHash": _hash_state(pre_state),
                 "verified": adv_ok,
                 "advisory": True,
             }
@@ -2240,6 +3307,14 @@ def run_remediation(args):
                 print(f"        disimpan di: {pw_path}")
             except Exception as exc:
                 print(f"    [!] Simpan password boot GAGAL: {exc}. Salin manual: {res['bootPassword']}")
+        if isinstance(res, dict) and (res.get("recoveryKey") or res.get("bootPassword")):
+            # Escrow server: redundansi bila host terkunci / file lokal hilang.
+            if res.get("recoveryKey"):
+                ok = _escrow_push("recovery", res["recoveryKey"])
+                print("    escrow recovery key ke server: " + ("OK" if ok else "GAGAL (file lokal tetap ada)"))
+            if res.get("bootPassword"):
+                ok = _escrow_push("bootpw", res["bootPassword"])
+                print("    escrow password boot ke server: " + ("OK" if ok else "GAGAL (file lokal tetap ada)"))
         verified = False
         try:
             verified = bool(entry["verify"]())
@@ -2256,6 +3331,7 @@ def run_remediation(args):
             "exitCode": int(exit_code) if isinstance(exit_code, (int, float)) else 0,
             # Hash menggambarkan output nyata: pre-state, hasil apply, dan post-state.
             "outputHash": _hash_state({"pre": pre_state, "apply": res, "post": post_state}),
+            "preStateHash": _hash_state(pre_state),
             "output": str(res.get("output", ""))[:400] if isinstance(res, dict) else "",
             "verified": verified
         }
@@ -2279,7 +3355,14 @@ def run_remediation(args):
                         rb_verified = False
                         state_matched = False
                         try:
-                            state_matched = _comparable_state(entry_rb["read"]()) == _comparable_state(pre)
+                            if "rollback_state" in entry_rb:
+                                now_state = entry_rb["rollback_state"]()
+                                keys = set(now_state) if isinstance(now_state, dict) else set()
+                                state_matched = _comparable_state(now_state) == _comparable_state(
+                                    {k: pre.get(k) for k in keys} if isinstance(pre, dict) else {}
+                                )
+                            else:
+                                state_matched = _comparable_state(entry_rb["read"]()) == _comparable_state(pre)
                         except Exception:
                             state_matched = False
                         rb_verified = state_matched
@@ -2304,6 +3387,10 @@ def run_remediation(args):
             if rollback_failures:
                 print(f"[!] {rollback_failures} langkah rollback tidak bersih — periksa backup di {_remediation_backup_dir()}")
             break
+
+    if not args.no_exec and to_status in ("VERIFIED", "ROLLED_BACK"):
+        _deadman_disarm(plan_id)
+        print("[*] Dead-man dibatalkan (hasil sudah final).")
 
     if args.no_exec:
         append_history({
@@ -2337,9 +3424,22 @@ def run_remediation(args):
     })
 
     demo_plan = str(plan_id).startswith("DEMO")
+    post_audit = None
+    if to_status == "VERIFIED" and not demo_plan:
+        try:
+            print("[*] Audit ulang pasca-remediasi (bukti perubahan nyata)...")
+            fresh = run_full_audit(plan.get("deviceId", "UNKNOWN"))
+            post_audit = {"scoring": fresh.get("scoring"), "compliance_matrix": fresh.get("compliance_matrix")}
+            score = (fresh.get("scoring") or {}).get("cyber_readiness_score")
+            print(f"    skor pasca-remediasi: {score}/100")
+        except Exception as exc:
+            print(f"[!] Audit ulang gagal ({exc}); server akan menolak VERIFIED.")
     if args.push_url and not demo_plan:
         try:
-            rc = _push_remediation_evidence(args.push_url, args.remediate_api_key, plan_id, plan.get("nonce", ""), to_status, evidence, args.hmac_key)
+            rc = _push_remediation_evidence(
+                args.push_url, args.remediate_api_key, plan_id, plan.get("nonce", ""),
+                to_status, evidence, args.hmac_key, post_audit
+            )
             print(f"[+] Evidence terkirim ke server ({rc}).")
         except Exception as e:
             print(f"[!] Gagal mengirim evidence: {e}")
@@ -2350,6 +3450,103 @@ def run_remediation(args):
 # -------------------------------------------------
 # EMERGENCY NETWORK QUARANTINE SWITCH (KILL-SWITCH)
 # ==============================================================================
+def verify_agent_manifest(args):
+    """Bandingkan hash agen lokal dengan manifest server. True bila cocok."""
+    base = (getattr(args, "server", None) or "").rstrip("/")
+    if not base:
+        print("[!] --verify-manifest butuh --server.")
+        return False
+    req = urllib.request.Request(base + "/api/agent/manifest", headers={"User-Agent": "PASOPATI-Agent/2.7"}, method="GET")
+    try:
+        with _urlopen(req, 10) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    except Exception as exc:
+        print(f"[!] Manifest tidak dapat diambil: {exc}")
+        return False
+    problems = []
+    for entry in data.get("files") or []:
+        name = entry.get("name")
+        remote = entry.get("sha256")
+        local_path = os.path.join(ROOT_DIR, str(name))
+        if not remote:
+            problems.append(f"{name}: server tidak punya hash")
+            continue
+        try:
+            with open(local_path, "rb") as f:
+                local = hashlib.sha256(f.read()).hexdigest()
+        except Exception:
+            problems.append(f"{name}: berkas lokal tidak ada")
+            continue
+        if local != remote:
+            problems.append(f"{name}: hash beda ({local[:12]} != {str(remote)[:12]})")
+    signature = data.get("signature")
+    key = getattr(args, "manifest_key", "") or os.environ.get("AGENT_SIGNING_KEY", "")
+    if signature and key:
+        canonical = json.dumps(data.get("files") or [], sort_keys=True, separators=(",", ":"))
+        expected = hmac.new(key.encode("utf-8"), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, str(signature)):
+            problems.append("tanda tangan manifest tidak valid")
+    elif signature:
+        print("[i] Manifest bertanda tangan, tetapi --manifest-key/AGENT_SIGNING_KEY tidak diset.")
+    if problems:
+        print("[!] Manifest TIDAK cocok:")
+        for problem in problems:
+            print(f"    - {problem}")
+        return False
+    print(f"[+] Manifest agen cocok (versi {data.get('version')}, {len(data.get('files') or [])} berkas).")
+    return True
+
+def _fetch_pending_plans(args):
+    base = (getattr(args, "server", None) or "").rstrip("/")
+    if not base:
+        raise RuntimeError("--server wajib diisi untuk --watch")
+    req = urllib.request.Request(
+        base + "/api/hosts/me/plans",
+        headers={"User-Agent": "PASOPATI-Agent/2.7", **_auth_headers()},
+        method="GET",
+    )
+    with _urlopen(req, 10) as resp:
+        data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+    return [p for p in (data.get("plans") or []) if isinstance(p, dict) and p.get("planId")]
+
+
+def run_watch(args):
+    global _HOST_KEY, _CA_CERT, _INSECURE
+    _HOST_KEY = getattr(args, "host_key", "") or os.environ.get("PASOPATI_HOST_KEY", "")
+    _CA_CERT = getattr(args, "ca_cert", "") or ""
+    _INSECURE = bool(getattr(args, "insecure", False))
+    if not _HOST_KEY:
+        print("[!] --watch butuh --host-key (host ter-enrol) atau env PASOPATI_HOST_KEY.")
+        return
+    interval = max(int(getattr(args, "interval", 60) or 60), 10)
+    attempted = {}
+    print(f"[*] Watch mode aktif. Polling tiap {interval} dtk (Ctrl+C untuk berhenti).")
+    while True:
+        try:
+            pending = _fetch_pending_plans(args)
+        except Exception as exc:
+            print(f"[!] Polling gagal: {exc}")
+            pending = []
+        for plan in pending:
+            plan_id = plan["planId"]
+            last = attempted.get(plan_id)
+            if last and time.time() - last < interval * 5:
+                continue
+            attempted[plan_id] = time.time()
+            print(f"[*] Plan {plan_id} ({plan.get('items')} langkah) dijalankan otomatis.")
+            child = argparse.Namespace(**vars(args))
+            child.plan_id = plan_id
+            child.remediate_plan = None
+            child.remediate_token = None
+            child.demo = False
+            child.force_access_risk = True  # unattended: preflight hanya peringatan
+            try:
+                run_remediation(child)
+            except Exception as exc:
+                print(f"[!] Plan {plan_id} gagal: {exc}")
+        time.sleep(interval)
+
+
 def _iptables_ensure(args):
     """Tambahkan rule iptables hanya bila belum ada (idempoten)."""
     if subprocess.run(["iptables", "-C"] + args, capture_output=True).returncode == 0:
@@ -2427,10 +3624,30 @@ def main(argv=None, entry_script=None, parser_only=False):
     parser.add_argument("--no-exec", action="store_true", help="Mode aman: validasi token & tampilkan rencana tanpa melakukan perubahan apa pun")
     parser.add_argument("--demo", action="store_true", help="Mode DEMO sekali-klik: lewati token + buat plan otomatis dari audit. Tetap butuh admin/root untuk eksekusi.")
     parser.add_argument("--no-elevate", action="store_true", help="Jangan meminta root/UAC otomatis (audit jalan dengan hak saat ini)")
+    parser.add_argument("--force-access-risk", action="store_true", help="Lanjut walau plan memblokir kanal akses remote (pastikan ada konsol/KVM)")
+    parser.add_argument("--deadman-seconds", type=int, default=_env_int(DEADMAN_ENV, DEFAULT_DEADMAN_SECONDS), help="Rollback otomatis bila hasil tak dikonfirmasi dalam N detik (0 = mati)")
+    parser.add_argument("--deadman-rollback", nargs=2, metavar=("PLAN_ID", "BACKUP_DIR"), default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--resume", action="store_true", help="Lanjutkan plan EXECUTING yang terputus; lewati langkah yang sudah terverifikasi")
+    parser.add_argument("--host-key", default=os.environ.get("PASOPATI_HOST_KEY"), help="Kunci host ter-enrol (X-Pasopati-Host-Key); env PASOPATI_HOST_KEY")
+    parser.add_argument("--host-id", default=os.environ.get("PASOPATI_HOST_ID"), help="ID host ter-enrol (informasi/log)")
+    parser.add_argument("--ca-cert", default=None, help="Path CA PEM untuk memverifikasi server HTTPS (pinning)")
+    parser.add_argument("--insecure", action="store_true", help="Matikan verifikasi sertifikat TLS server")
+    parser.add_argument("--watch", action="store_true", help="Polling plan terikat milik host lalu jalankan otomatis (butuh --host-key)")
+    parser.add_argument("--interval", type=int, default=60, help="Detik antar polling --watch (min 10)")
+    parser.add_argument("--profile", choices=("standard", "none"), default="standard", help="Paket profil kontrol deklaratif (default: standard)")
+    parser.add_argument("--verify-manifest", action="store_true", help="Bandingkan hash agen lokal dengan manifest server")
+    parser.add_argument("--strict-manifest", action="store_true", help="Batal bila manifest tidak cocok/mengandung berkas berbeda")
+    parser.add_argument("--manifest-key", default=os.environ.get("AGENT_SIGNING_KEY"), help="Kunci HMAC untuk memverifikasi tanda tangan manifest")
+    parser.add_argument("--list-aliases", action="store_true", help="Tampilkan alias remediasi dipisah per OS (windows/linux/any) lalu keluar")
     parser.add_argument("--elevated", action="store_true", help=argparse.SUPPRESS)
     if parser_only:
         return parser
     args = parser.parse_args(argv)
+    if args.list_aliases:
+        print_aliases_by_os()
+        return
+    global AUDIT_PROFILE
+    AUDIT_PROFILE = args.profile
 
     # Normalisasi path sebelum elevasi agar tidak bergantung cwd jendela Administrator.
     args.output = os.path.abspath(args.output)
@@ -2446,8 +3663,23 @@ def main(argv=None, entry_script=None, parser_only=False):
     if getattr(args, "elevated", False):
         atexit.register(_elevated_finish)
 
+    if args.verify_manifest:
+        ok = verify_agent_manifest(args)
+        if not ok and args.strict_manifest:
+            sys.exit(2)
+        if not args.remediate_plan and not args.plan_id and not args.demo and not args.watch:
+            return
+
+    if args.watch:
+        run_watch(args)
+        return
+
     if args.remediate_plan or args.plan_id or args.demo:
         run_remediation(args)
+        return
+
+    if args.deadman_rollback:
+        run_deadman_rollback(args.deadman_rollback[0], args.deadman_rollback[1])
         return
 
     # Penting: --quarantine-release juga harus jalan tanpa flag --quarantine.

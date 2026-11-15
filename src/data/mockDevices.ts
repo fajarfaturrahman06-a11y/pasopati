@@ -366,8 +366,9 @@ export const INITIAL_MOCK_DEVICES: DeviceInfo[] = [
 
 export function calculateDeviceScore(checks: DeviceInfo['checks']): number {
   if (!checks || checks.length === 0) return 100;
-  // Kontrol N/A tidak dihitung dalam penyebut (sama seperti scoring agent).
-  const applicable = checks.filter(c => c.status !== 'N/A');
+  // Kontrol N/A & WAIVED tidak dihitung dalam penyebut (sama seperti scoring agent).
+  // Waiver dilaporkan terpisah agar tidak menjadi PASS palsu.
+  const applicable = checks.filter(c => c.status !== 'N/A' && c.status !== 'WAIVED');
   if (applicable.length === 0) return 100;
   const pass = applicable.filter(c => c.status === 'PASS').length;
   const warn = applicable.filter(c => c.status === 'WARNING').length;

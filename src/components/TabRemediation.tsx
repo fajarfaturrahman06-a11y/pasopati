@@ -1,6 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import { DeviceInfo, RemediationPlan, RemediationPlanItem } from '../types';
-import { approvePlan, createPlan, getPlan, wslCommandText, agentCommandText } from '../remediationApi';
+import { approvePlan, createPlan, getPlan, getWhoAmI, wslCommandText, agentCommandText, WhoAmI } from '../remediationApi';
 import { VerificationBadge } from './VerificationBadges';
 import { sfx } from '../utils/audio';
 import { buildRemediationItems } from '../remediationMapping';
@@ -9,13 +9,11 @@ import { ShieldCheck, Copy, Check, RefreshCw, FileJson, Terminal, KeyRound, List
 
 interface RemediationPanelProps {
   currentDevice: DeviceInfo | null;
-  apiKey: string;
   onShowToast: (message: string, type?: 'success' | 'info') => void;
 }
 
 export const RemediationPanel: React.FC<RemediationPanelProps> = ({
   currentDevice,
-  apiKey,
   onShowToast
 }) => {
   const [isBusy, setIsBusy] = useState(false);
@@ -29,6 +27,10 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
   const [dryRunNotice, setDryRunNotice] = useState<string | null>(null);
   const [keyStatus, setKeyStatus] = useState<'empty' | 'checking' | 'ok' | 'bad' | 'offline'>('empty');
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
+  const [whoami, setWhoami] = useState<WhoAmI | null>(null);
+  const [selfApprove, setSelfApprove] = useState(false);
+  const [hosts, setHosts] = useState<Array<{ hostId: string; name: string; revokedAt?: string }>>([]);
+  const [hostId, setHostId] = useState('');
 
   // Jam lokal untuk menghitung kedaluwarsa token (tanpa perlu refresh manual).
   React.useEffect(() => {
@@ -41,30 +43,47 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
   const tokenExpired = Boolean(tokenExpiresAt) && nowMs >= tokenExpiresAt;
   const tokenRemainingSec = tokenExpiresAt ? Math.max(0, Math.ceil((tokenExpiresAt - nowMs) / 1000)) : 0;
 
-  // Preflight key: plan/approve selalu 401/503 bila key kosong atau salah.
+  // Preflight sesi login; setiap operasi plan/approve tetap divalidasi RBAC di backend.
   const checkKey = React.useCallback(async () => {
-    const key = apiKey.trim();
-    if (!key) {
-      setKeyStatus('empty');
-      return;
-    }
     setKeyStatus('checking');
     try {
-      const res = await fetch('/api/quarantine', { headers: { 'X-Pasopati-API-Key': key } });
+      const res = await fetch('/api/quarantine', { credentials: 'same-origin' });
       setKeyStatus(res.ok ? 'ok' : 'bad');
     } catch {
       setKeyStatus('offline');
     }
-  }, [apiKey]);
+  }, []);
 
   React.useEffect(() => {
     checkKey();
   }, [checkKey]);
 
+  // Identitas pemanggil + daftar host ter-enrol (untuk empat mata & pengikatan plan).
+  React.useEffect(() => {
+    if (keyStatus !== 'ok') {
+      setWhoami(null);
+      return;
+    }
+    let cancelled = false;
+    getWhoAmI()
+      .then(w => { if (!cancelled) setWhoami(w); })
+      .catch(() => {});
+    fetch('/api/hosts', { credentials: 'same-origin' })
+      .then(r => (r.ok ? r.json() : null))
+      .then(d => {
+        if (!cancelled && Array.isArray(d?.hosts)) {
+          setHosts(d.hosts.filter((h: { revokedAt?: string }) => !h.revokedAt));
+        }
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [keyStatus]);
+
   // Parameter remediasi diturunkan langsung dari temuan hardening (FAIL/WARNING).
   const draftItems = useMemo<RemediationPlanItem[]>(() => buildRemediationItems(currentDevice), [currentDevice]);
 
   const [selectedAliases, setSelectedAliases] = useState<Record<string, boolean>>({});
+  const [ackConsole, setAckConsole] = useState(false);
   const toggleAlias = (alias: string) =>
     setSelectedAliases(prev => ({ ...prev, [alias]: prev[alias] === false ? true : false }));
 
@@ -83,6 +102,7 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
     setPlan(null);
     setToken('');
     setSelectedAliases({});
+    setAckConsole(false);
   }, [currentDevice?.id]);
 
   const handleCreatePlan = async () => {
@@ -90,9 +110,11 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
     setIsBusy(true);
     sfx.playPing();
     try {
-      const created = await createPlan(apiKey, currentDevice.id, selectedItems, 'puskodal_operator');
+      const created = await createPlan(currentDevice.id, selectedItems, hostId || undefined);
       setPlan(created);
       setToken('');
+      setAckConsole(false);
+      setSelfApprove(false);
       onShowToast('Plan remediasi ' + created.planId + ' dibuat (PLANNED).');
     } catch (err: any) {
       onShowToast(err?.message || 'Gagal membuat plan.', 'info');
@@ -108,7 +130,7 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
     try {
       // approved.plan = plan LENGKAP sekali (berisi nonce/signature) — simpan langsung
       // untuk plan.json agent. JANGAN ambil dari GET (sudah diredaksi).
-      const approved = await approvePlan(apiKey, plan.planId, 'puskodal_operator');
+      const approved = await approvePlan(plan.planId, ackConsole, selfApprove);
       setToken(approved.token);
       setPlan(approved.plan);
       setNowMs(Date.now());
@@ -128,7 +150,7 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
     if (!plan) return;
     setIsBusy(true);
     try {
-      const refreshed = await getPlan(apiKey, plan.planId);
+      const refreshed = await getPlan(plan.planId);
       // GET meredaksi nonce/signature. Pertahankan nilai yang sudah dimiliki agar
       // plan.json tetap valid untuk agent setelah refresh.
       setPlan(prev => prev ? {
@@ -165,19 +187,19 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
 
   if (!currentDevice) {
     return (
-      <div className="p-5 rounded-lg bg-[#1b202a] border border-[#2a3140] text-sm font-mono text-slate-400">
+      <div className="p-5 rounded-lg bg-slate-900/80 border border-slate-800 text-sm font-mono text-slate-400">
         Tidak ada perangkat tersedia.
       </div>
     );
   }
 
   const planJsonText = plan ? JSON.stringify(plan, null, 2) : '';
-  const cmdText = plan ? agentCommandText(serverUrl, plan.planId, apiKey, hmacKey) : '';
-  const fallbackCmdText = plan ? wslCommandText(serverUrl, 'plan.json', token, apiKey) : '';
+  const cmdText = plan ? agentCommandText(serverUrl, plan.planId, '', hmacKey, Boolean(plan.requiresConsoleAck)) : '';
+  const fallbackCmdText = plan ? wslCommandText(serverUrl, 'plan.json', token, '', Boolean(plan.requiresConsoleAck)) : '';
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 bg-[#171b23] p-5 rounded-lg border border-[#2a3140]">
+      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 bg-slate-900/60 p-5 rounded-lg border border-slate-800">
         <div>
           <div className="flex items-center gap-2">
             <h3 className="text-lg font-bold tracking-tight text-rose-400 font-mono">
@@ -192,8 +214,8 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
         </div>
       </div>
 
-      <div className="bg-[#1b202a] border border-[#2a3140] rounded-lg p-5 space-y-4">
-        <div className="flex items-center justify-between border-b border-[#2a3140] pb-3 flex-wrap gap-2">
+      <div className="bg-slate-900/80 border border-slate-800 rounded-lg p-5 space-y-4">
+        <div className="flex items-center justify-between border-b border-slate-800 pb-3 flex-wrap gap-2">
           <div className="flex items-center gap-2">
             <ListChecks className="w-4 h-4 text-rose-400" />
             <h3 className="text-sm font-bold font-mono text-slate-200 uppercase tracking-wider">
@@ -206,7 +228,7 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
         </div>
 
         {draftItems.length === 0 ? (
-          <div className="p-4 rounded bg-[#0d1016]/60 border border-[#2a3140] text-xs font-mono text-slate-400">
+          <div className="p-4 rounded bg-slate-950/60 border border-slate-800 text-xs font-mono text-slate-400">
             Tidak ada temuan FAIL/WARNING yang terpetakan ke allowlist agent
             (fw-enable-defender · guest-account-disable · usb-storage-block · fw-enable-ufw
             · ssh-disable-root · auditd-enable · usb-block-linux
@@ -219,16 +241,21 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
             {draftItems.map(item => {
               const check = currentDevice.checks.find(c => c.id === item.findingId);
               return (
-                <label key={item.alias} className="flex items-center gap-3 p-3 rounded bg-[#0d1016] border border-[#2a3140] cursor-pointer">
+                <label key={item.alias} className="flex items-center gap-3 p-3 rounded bg-slate-950 border border-slate-800 cursor-pointer">
                   <input
                     type="checkbox"
                     checked={isSelected(item)}
                     onChange={() => toggleAlias(item.alias)}
-                    className="rounded bg-[#0d1016] border-[#333b4b] text-rose-600 focus:ring-0"
+                    className="rounded bg-slate-950 border-slate-700 text-rose-600 focus:ring-0"
                   />
                   <div className="flex-1 min-w-0">
                     <div className="text-xs font-mono text-slate-100 truncate">
                       {item.alias} <span className="text-slate-500">· risiko {item.risk} · reversibel</span>
+                      {item.alias === 'ports-block-windows' && (currentDevice.openPorts || []).includes(3389) && (
+                        <span className="ml-1 text-[10px] font-mono px-1.5 py-0.5 rounded bg-rose-950 text-rose-300 border border-rose-800">
+                          PUTUS RDP
+                        </span>
+                      )}
                     </div>
                     <div className="text-[11px] font-mono text-slate-500 truncate">
                       {check ? `[${check.cis_id}] ${check.parameter} — ${check.details}` : item.preState}
@@ -254,15 +281,15 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
           keyStatus === 'ok'
             ? 'bg-emerald-950/40 border-emerald-800 text-emerald-300'
             : keyStatus === 'checking'
-            ? 'bg-[#171b23] border-[#333b4b] text-slate-300'
+            ? 'bg-slate-900 border-slate-700 text-slate-300'
             : 'bg-amber-950/40 border-amber-800 text-amber-300'
         }`}>
-          {keyStatus === 'ok' && <span>✓ Key operasional valid — plan &amp; approve siap dijalankan.</span>}
-          {keyStatus === 'checking' && <span>Menguji key operasional…</span>}
-          {keyStatus === 'empty' && <span>API key belum diisi. Isi kolom <b>PASOPATI_API_KEY</b> pada kartu kunci di atas.</span>}
-          {keyStatus === 'bad' && <span>Key ditolak server (401/503). Pastikan sama dengan <code>PASOPATI_API_KEY</code> di <code>.env</code> server.</span>}
+          {keyStatus === 'ok' && <span>✓ Sesi login valid{whoami?.role ? ` · role ${whoami.role}` : ''}. Izin membuat/menyetujui plan mengikuti RBAC server.</span>}
+          {keyStatus === 'checking' && <span>Memeriksa sesi login…</span>}
+          {keyStatus === 'empty' && <span>Belum ada sesi aktif. Masuk melalui layar login PASOPATI.</span>}
+          {keyStatus === 'bad' && <span>Sesi ditolak server. Keluar lalu masuk kembali dengan username dan password.</span>}
           {keyStatus === 'offline' && <span>Server tidak terjangkau. Jalankan <code>npm run dev</code> lalu muat ulang.</span>}
-          <button onClick={checkKey} className="ml-auto px-2 py-0.5 rounded bg-[#171b23] border border-[#333b4b] text-slate-300 hover:text-rose-300">
+          <button onClick={checkKey} className="ml-auto px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-300 hover:text-rose-300">
             tes ulang
           </button>
         </div>
@@ -274,8 +301,8 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
           </div>
         )}
 
-        <div className="bg-[#0d1016] rounded-lg border border-[#2a3140] overflow-hidden">
-          <div className="p-2.5 bg-[#171b23] border-b border-[#2a3140] flex items-center justify-between flex-wrap gap-2">
+        <div className="bg-slate-950 rounded-lg border border-slate-800 overflow-hidden">
+          <div className="p-2.5 bg-slate-900 border-b border-slate-800 flex items-center justify-between flex-wrap gap-2">
             <span className="text-xs font-mono font-semibold text-rose-400 flex items-center gap-1.5">
               <FileJson className="w-3.5 h-3.5" />
               2b. Runbook yang dihasilkan ({selectedItems.length} langkah terpilih)
@@ -295,9 +322,9 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
               </button>
             </div>
           </div>
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-0 divide-y lg:divide-y-0 lg:divide-x divide-[#2a3140]">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-0 divide-y lg:divide-y-0 lg:divide-x divide-slate-800">
             <div>
-              <div className="px-3 py-2 text-[11px] font-mono text-rose-400 border-b border-[#2a3140] flex items-center justify-between">
+              <div className="px-3 py-2 text-[11px] font-mono text-rose-400 border-b border-slate-800 flex items-center justify-between">
                 <span>hardening</span>
                 <button onClick={() => copyText(scripts.hard, 'hard')} className="text-slate-400 hover:text-rose-400">
                   {copied === 'hard' ? 'tersalin' : 'salin'}
@@ -306,7 +333,7 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
               <pre className="p-3 text-[11px] font-mono text-slate-300 overflow-auto max-h-56 leading-relaxed">{scripts.hard}</pre>
             </div>
             <div>
-              <div className="px-3 py-2 text-[11px] font-mono text-sky-400 border-b border-[#2a3140] flex items-center justify-between">
+              <div className="px-3 py-2 text-[11px] font-mono text-sky-400 border-b border-slate-800 flex items-center justify-between">
                 <span>rollback</span>
                 <button onClick={() => copyText(scripts.roll, 'roll')} className="text-slate-400 hover:text-sky-400">
                   {copied === 'roll' ? 'tersalin' : 'salin'}
@@ -315,10 +342,10 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
               <pre className="p-3 text-[11px] font-mono text-slate-300 overflow-auto max-h-56 leading-relaxed">{scripts.roll}</pre>
             </div>
           </div>
-          <div className="p-3 border-t border-[#2a3140] flex flex-wrap items-center gap-2">
+          <div className="p-3 border-t border-slate-800 flex flex-wrap items-center gap-2">
             <button
               onClick={() => { setDryRunNotice('Runbook ini selalu diawali mode aman. Jalankan dengan --dry-run (Linux) atau -DryRun (Windows) sebelum eksekusi nyata.'); sfx.playClick(); }}
-              className="text-[11px] font-mono px-2 py-1 rounded bg-[#171b23] border border-[#333b4b] text-slate-300 hover:text-amber-300"
+              className="text-[11px] font-mono px-2 py-1 rounded bg-slate-900 border border-slate-700 text-slate-300 hover:text-amber-300"
             >
               cara uji aman
             </button>
@@ -326,10 +353,68 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
           </div>
         </div>
 
-        <div className="flex items-center gap-2 pt-1">
+        <div className="flex items-center gap-2 pt-1 flex-wrap">
           <ShieldCheck className="w-4 h-4 text-rose-400" />
           <span className="text-xs font-mono font-bold text-slate-200 uppercase tracking-wider">2c. Setujui &amp; eksekusi</span>
+          {whoami && (
+            <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-300">
+              operator: {whoami.name} · {whoami.role}
+            </span>
+          )}
         </div>
+
+        <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono text-slate-400">
+          <label className="flex items-center gap-2">
+            ikat ke host (opsional):
+            <select
+              value={hostId}
+              onChange={(e) => setHostId(e.target.value)}
+              className="px-2 py-1 bg-slate-900 border border-slate-700 rounded text-slate-200"
+            >
+              <option value="">— tidak diikat —</option>
+              {hosts.map(h => (
+                <option key={h.hostId} value={h.hostId}>{h.name} ({h.hostId})</option>
+              ))}
+            </select>
+          </label>
+          <span className="text-slate-600">host terikat hanya boleh mengeksekusi plan miliknya.</span>
+        </div>
+
+        {plan?.requiresConsoleAck && (
+          <div className="p-3 rounded border border-rose-800 bg-rose-950/40 space-y-2">
+            <div className="text-[11px] font-mono font-bold text-rose-300 uppercase tracking-wide">
+              Plan ini menyentuh jalur akses host
+            </div>
+            <ul className="text-[11px] font-mono text-rose-200/90 space-y-1 list-disc pl-4">
+              {(plan.accessNotes || []).map(note => <li key={note}>{note}</li>)}
+            </ul>
+            <label className="flex items-start gap-2 text-[11px] font-mono text-rose-100 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={ackConsole}
+                onChange={(e) => setAckConsole(e.target.checked)}
+                className="mt-0.5 rounded bg-slate-950 border-rose-700 text-rose-500 focus:ring-0"
+              />
+              Saya sudah punya konsol/KVM atau siap rollback — lanjutkan approve.
+            </label>
+          </div>
+        )}
+
+        {whoami && plan && plan.createdBy === whoami.name && (
+          <div className="p-3 rounded border border-amber-800 bg-amber-950/30 text-[11px] font-mono text-amber-200 flex flex-wrap items-center gap-2">
+            <AlertTriangle className="w-3.5 h-3.5" />
+            Plan dibuat oleh Anda sendiri ({whoami.name}). Empat mata: minta operator lain approve, atau
+            <label className="flex items-center gap-1.5 cursor-pointer text-amber-100">
+              <input
+                type="checkbox"
+                checked={selfApprove}
+                onChange={(e) => setSelfApprove(e.target.checked)}
+                className="rounded bg-slate-950 border-amber-700 text-amber-500 focus:ring-0"
+              />
+              setujui sendiri
+            </label>
+          </div>
+        )}
 
         <div className="flex flex-col sm:flex-row gap-3 pt-1">
           <button
@@ -340,7 +425,7 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
             {isBusy ? 'MEMPROSES…' : 'BUAT PLAN'}
           </button>
           <button
-            disabled={isBusy || keyStatus !== 'ok' || !plan || !(plan.status === 'PLANNED' || (plan.status === 'APPROVED' && tokenExpired))}
+            disabled={isBusy || keyStatus !== 'ok' || !plan || (Boolean(plan.requiresConsoleAck) && !ackConsole) || (Boolean(whoami) && plan.createdBy === whoami?.name && !selfApprove) || !(plan.status === 'PLANNED' || (plan.status === 'APPROVED' && tokenExpired))}
             onClick={handleApprovePlan}
             className="flex-1 py-2.5 px-4 rounded-lg text-xs font-bold font-mono bg-sky-600 hover:bg-sky-500 text-white disabled:opacity-50 transition-all"
           >
@@ -349,7 +434,7 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
           <button
             disabled={isBusy || !plan}
             onClick={handleRefresh}
-            className="py-2.5 px-4 rounded-lg text-xs font-bold font-mono bg-[#171b23] hover:bg-[#232936] text-slate-200 border border-[#333b4b] disabled:opacity-50 flex items-center justify-center gap-2 transition-all"
+            className="py-2.5 px-4 rounded-lg text-xs font-bold font-mono bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700 disabled:opacity-50 flex items-center justify-center gap-2 transition-all"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${isBusy ? 'animate-spin' : ''}`} />
             REFRESH
@@ -358,8 +443,8 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
       </div>
 
       {plan && (
-        <div className="bg-[#1b202a] border border-[#2a3140] rounded-lg p-5 space-y-4">
-          <div className="flex items-center justify-between border-b border-[#2a3140] pb-3 flex-wrap gap-2">
+        <div className="bg-slate-900/80 border border-slate-800 rounded-lg p-5 space-y-4">
+          <div className="flex items-center justify-between border-b border-slate-800 pb-3 flex-wrap gap-2">
             <div className="flex items-center gap-2">
               <ShieldCheck className="w-4 h-4 text-rose-400" />
               <h3 className="text-sm font-bold font-mono text-slate-200 uppercase tracking-wider">
@@ -369,19 +454,19 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
             <VerificationBadge planStatus={plan.status} />
           </div>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs font-mono">
-            <div className="p-3 rounded bg-[#0d1016] border border-[#2a3140]">
+            <div className="p-3 rounded bg-slate-950 border border-slate-800">
               <span className="text-slate-500 block">Status</span>
               <span className="text-slate-100 font-bold">{plan.status}</span>
             </div>
-            <div className="p-3 rounded bg-[#0d1016] border border-[#2a3140]">
+            <div className="p-3 rounded bg-slate-950 border border-slate-800">
               <span className="text-slate-500 block">Perangkat</span>
               <span className="text-slate-100 font-bold">{plan.deviceId}</span>
             </div>
-            <div className="p-3 rounded bg-[#0d1016] border border-[#2a3140]">
+            <div className="p-3 rounded bg-slate-950 border border-slate-800">
               <span className="text-slate-500 block">Dibuat oleh</span>
               <span className="text-slate-100 font-bold">{plan.createdBy}</span>
             </div>
-            <div className="p-3 rounded bg-[#0d1016] border border-[#2a3140]">
+            <div className="p-3 rounded bg-slate-950 border border-slate-800">
               <span className="text-slate-500 block">Disetujui</span>
               <span className="text-slate-100 font-bold">{plan.approvedBy || '—'}</span>
             </div>
@@ -408,7 +493,7 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
             <div className="space-y-2">
               <span className="text-xs font-mono text-slate-400 font-semibold block">Evidence dari agent:</span>
               {plan.evidence.map((ev, i) => (
-                <div key={i} className="p-3 rounded bg-[#0d1016] border border-[#2a3140] text-[11px] font-mono flex flex-wrap gap-x-4 gap-y-1">
+                <div key={i} className="p-3 rounded bg-slate-950 border border-slate-800 text-[11px] font-mono flex flex-wrap gap-x-4 gap-y-1">
                   <span className="text-slate-300">step {ev.stepIndex}</span>
                   <span className="text-slate-100">{ev.alias}</span>
                   <span className="text-slate-400">exitCode: {ev.exitCode}</span>
@@ -432,8 +517,8 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
           )}
 
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <div className="bg-[#0d1016] rounded-lg border border-[#2a3140] overflow-hidden flex flex-col">
-              <div className="p-2.5 bg-[#171b23] border-b border-[#2a3140] flex items-center justify-between">
+            <div className="bg-slate-950 rounded-lg border border-slate-800 overflow-hidden flex flex-col">
+              <div className="p-2.5 bg-slate-900 border-b border-slate-800 flex items-center justify-between">
                 <span className="text-xs font-mono font-semibold text-rose-400 flex items-center gap-1.5">
                   <FileJson className="w-3.5 h-3.5" />
                   plan.json (fallback offline)
@@ -448,8 +533,8 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
               </div>
               <pre className="p-3 text-[11px] font-mono text-slate-300 overflow-auto max-h-56 leading-relaxed">{planJsonText}</pre>
             </div>
-            <div className="bg-[#0d1016] rounded-lg border border-[#2a3140] overflow-hidden flex flex-col">
-              <div className="p-2.5 bg-[#171b23] border-b border-[#2a3140] flex items-center justify-between">
+            <div className="bg-slate-950 rounded-lg border border-slate-800 overflow-hidden flex flex-col">
+              <div className="p-2.5 bg-slate-900 border-b border-slate-800 flex items-center justify-between">
                 <span className="text-xs font-mono font-semibold text-sky-400 flex items-center gap-1.5">
                   <Terminal className="w-3.5 h-3.5" />
                   Perintah untuk Agent (host target)
@@ -470,7 +555,7 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
                     type="text"
                     value={serverUrl}
                     onChange={e => setServerUrl(e.target.value)}
-                    className="flex-1 min-w-0 px-2 py-1 text-[11px] font-mono bg-[#171b23] border border-[#333b4b] rounded text-slate-200 focus:outline-none focus:border-rose-500"
+                    className="flex-1 min-w-0 px-2 py-1 text-[11px] font-mono bg-slate-900 border border-slate-700 rounded text-slate-200 focus:outline-none focus:border-sky-500"
                   />
                 </div>
                 <div className="flex items-center gap-2 text-[11px] font-mono text-slate-400">
@@ -481,13 +566,17 @@ export const RemediationPanel: React.FC<RemediationPanelProps> = ({
                     value={hmacKey}
                     onChange={e => setHmacKey(e.target.value)}
                     placeholder="dari .env server"
-                    className="flex-1 min-w-0 px-2 py-1 text-[11px] font-mono bg-[#171b23] border border-[#333b4b] rounded text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-rose-500"
+                    className="flex-1 min-w-0 px-2 py-1 text-[11px] font-mono bg-slate-900 border border-slate-700 rounded text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-rose-500"
                   />
                 </div>
                 <pre className="text-[11px] font-mono text-rose-300 overflow-auto max-h-40 leading-relaxed whitespace-pre-wrap">{cmdText || 'Approve plan untuk mendapatkan perintah…'}</pre>
                 <p className="text-[11px] font-mono text-slate-500">
                   Jalankan di host target. Agent mengambil plan langsung dari server — target hanya butuh <code>pasopati_remediate.py</code> + <code>pasopati_audit.py</code>.
                   Tambahkan <code>--no-exec</code> untuk uji aman.
+                </p>
+                <p className="text-[11px] font-mono text-amber-400/90">
+                  Dead-man: bila hasil tidak dikonfirmasi, host rollback otomatis setelah 10 menit
+                  (<code>--deadman-seconds 0</code> untuk mematikan). Kunci BitLocker di-escrow ke server.
                 </p>
                 {token && (
                   <details className="text-[11px] font-mono text-slate-500">

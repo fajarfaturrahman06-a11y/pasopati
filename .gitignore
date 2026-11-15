@@ -5,6 +5,8 @@ coverage/
 .DS_Store
 *.log
 *.zip
+*.bak
+*.tmp
 .env*
 !.env.example
 audit_result.json
@@ -12,8 +14,6 @@ audit.json
 token.txt
 __pycache__/
 *.pyc
-# State runtime di root ONLY — jangan pakai pola 'data/' polos
-# karena akan meng-ignore src/data/ (mockDevices.ts dll)
 /data/
 
 # Konfigurasi lokal (berisi API key provider)
@@ -21,12 +21,6 @@ opencode.json
 # Kunci pemulihan BitLocker per mesin
 bitlocker-recovery-*.txt
 
-# Runtime state + skrip berisi API key hardcoded (jangan pernah di-push)
-plan.json
-reapprove.ps1
-.freebuff/
-# Diblokir Windows Defender (PUA) — tidak bisa dibaca/di-commit
-setup-lan.ps1
-
-# Salinan folder bersarang (bukan submodule)
-satria-guard/
+# State lokal agent (backup pre-state remediasi)
+.pasopati/
+audit-full.json

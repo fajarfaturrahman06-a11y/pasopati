@@ -1,16 +1,12 @@
 import { RemediationPlan, RemediationPlanItem } from './types';
 
-function apiHeaders(apiKey: string): Record<string, string> {
-  const key = (apiKey || '').trim();
-  return key
-    ? { 'Content-Type': 'application/json', 'X-Pasopati-API-Key': key }
-    : { 'Content-Type': 'application/json' };
-}
+const jsonHeaders = { 'Content-Type': 'application/json' };
 
-export async function postJson<T>(path: string, apiKey: string, body: unknown): Promise<T> {
+export async function postJson<T>(path: string, body: unknown): Promise<T> {
   const res = await fetch(path, {
     method: 'POST',
-    headers: apiHeaders(apiKey),
+    credentials: 'same-origin',
+    headers: jsonHeaders,
     body: JSON.stringify(body)
   });
   const data = await res.json().catch(() => null);
@@ -20,8 +16,8 @@ export async function postJson<T>(path: string, apiKey: string, body: unknown): 
   return data as T;
 }
 
-export async function getJson<T>(path: string, apiKey: string): Promise<T> {
-  const res = await fetch(path, { headers: apiHeaders(apiKey) });
+export async function getJson<T>(path: string): Promise<T> {
+  const res = await fetch(path, { credentials: 'same-origin' });
   const data = await res.json().catch(() => null);
   if (!res.ok) {
     throw new Error((data && data.reason) ? String(data.reason) : `HTTP ${res.status}`);
@@ -30,38 +26,49 @@ export async function getJson<T>(path: string, apiKey: string): Promise<T> {
 }
 
 export async function createPlan(
-  apiKey: string,
   deviceId: string,
   items: RemediationPlanItem[],
-  createdBy: string
+  hostId?: string
 ): Promise<RemediationPlan> {
-  const data = await postJson<{ plan: RemediationPlan }>('/api/remediation-plan', apiKey, {
+  const data = await postJson<{ plan: RemediationPlan }>('/api/remediation-plan', {
     deviceId,
     items,
-    createdBy
+    ...(hostId ? { hostId } : {})
   });
   return data.plan;
 }
 
 export async function approvePlan(
-  apiKey: string,
   planId: string,
-  approvedBy: string
+  acknowledgeConsole = false,
+  selfApprove = false
 ): Promise<{ planId: string; nonce: string; expiresAt: number; signature: string; token: string; plan: RemediationPlan }> {
-  return postJson('/api/remediation-approve', apiKey, { planId, approvedBy });
+  return postJson('/api/remediation-approve', { planId, acknowledgeConsole, selfApprove });
 }
 
-export async function getPlan(apiKey: string, planId: string): Promise<RemediationPlan> {
-  const data = await getJson<{ plan: RemediationPlan }>('/api/remediation-plans/' + encodeURIComponent(planId), apiKey);
+export interface WhoAmI {
+  name: string;
+  role: string;
+  kind: string;
+  hostId?: string;
+}
+
+export async function getWhoAmI(): Promise<WhoAmI> {
+  return getJson<WhoAmI>('/api/whoami');
+}
+
+export async function getPlan(planId: string): Promise<RemediationPlan> {
+  const data = await getJson<{ plan: RemediationPlan }>('/api/remediation-plans/' + encodeURIComponent(planId));
   return data.plan;
 }
 
-export async function listPlans(apiKey: string): Promise<RemediationPlan[]> {
-  const data = await getJson<{ plans: RemediationPlan[] }>('/api/remediation-plans', apiKey);
+export async function listPlans(): Promise<RemediationPlan[]> {
+  const data = await getJson<{ plans: RemediationPlan[] }>('/api/remediation-plans');
   return Array.isArray(data.plans) ? data.plans : [];
 }
 
-export function wslCommandText(serverUrl: string, planPath: string, token: string, apiKey: string): string {
+/** Command for an agent host; login credentials stay out of the dashboard UI. */
+export function wslCommandText(serverUrl: string, planPath: string, token: string, apiKey: string, forceAccessRisk = false): string {
   const server = (serverUrl || 'http://localhost:3000').trim().replace(/\/$/, '');
   const plan = (planPath || 'plan.json').trim() || 'plan.json';
   const tkn = (token || '').trim() || '<nonce>.<signature>';
@@ -72,15 +79,15 @@ export function wslCommandText(serverUrl: string, planPath: string, token: strin
     '  --push-url "' + server + '"',
     '  --remediate-api-key "' + key + '"',
     '  --hmac-key "$HMAC_SECRET"',
-    '  --no-exec'
+    '  --no-exec' + (forceAccessRisk ? ' --force-access-risk' : '')
   ].join(' \\\n');
 }
 
 /** Perintah untuk host target: ambil plan langsung dari server (target hanya butuh agent). */
-export function agentCommandText(serverUrl: string, planId: string, apiKey: string, hmacKey: string): string {
+export function agentCommandText(serverUrl: string, planId: string, apiKey: string, hmacKey: string, forceAccessRisk = false): string {
   const server = (serverUrl || 'http://localhost:3000').trim().replace(/\/$/, '');
   const id = (planId || '<PLAN_ID>').trim();
   const key = (apiKey || '').trim() || '<PASOPATI_API_KEY>';
   const hmac = (hmacKey || '').trim() || '<HMAC_SECRET>';
-  return `python pasopati_remediate.py --server "${server}" --plan-id "${id}" --remediate-api-key "${key}" --hmac-key "${hmac}"`;
+  return `python pasopati_remediate.py --server "${server}" --plan-id "${id}" --remediate-api-key "${key}" --hmac-key "${hmac}"` + (forceAccessRisk ? ' --force-access-risk' : '');
 }

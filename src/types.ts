@@ -1,4 +1,11 @@
-export type CheckStatus = 'PASS' | 'WARNING' | 'FAIL' | 'N/A';
+export type CheckStatus = 'PASS' | 'WARNING' | 'FAIL' | 'N/A' | 'WAIVED';
+
+export interface CheckWaiver {
+  id: string;
+  reason: string;
+  owner: string;
+  expiresAt: string;
+}
 
 export interface SecurityCheck {
   id: string;
@@ -6,6 +13,9 @@ export interface SecurityCheck {
   category: 'Network & Port' | 'Access Control' | 'Endpoint Protection' | 'System Logging' | 'Kernel & Boot' | 'Cryptographic Posture' | 'Privilege Boundary';
   cis_id: string;
   status: CheckStatus;
+  /** Status asli sebelum di-waive (untuk pemulihan). */
+  baseStatus?: CheckStatus;
+  waiver?: CheckWaiver;
   details: string;
   mitigation: string;
 }
@@ -21,6 +31,10 @@ export interface ComplianceHistoryPoint {
 
 export interface DeviceInfo {
   id: string;
+  /** Version token untuk mencegah browser lama menimpa perubahan yang lebih baru. */
+  revision?: number;
+  /** Identitas agen/unit yang stabil, bila endpoint didaftarkan oleh agent. */
+  agentId?: string;
   name: string;
   hostname: string;
   role: string;
@@ -83,6 +97,7 @@ export interface AuditLogEntry {
   changesDetails: string[];
   status: 'SUCCESS' | 'WARNING' | 'FAILED';
   storedInDb: boolean;
+  deletedAt?: string;
 }
 
 export type PlanStatus = 'PLANNED' | 'APPROVED' | 'EXECUTING' | 'VERIFIED' | 'ROLLED_BACK' | 'FAILED';
@@ -126,4 +141,6 @@ export interface RemediationPlan {
   hasToken?: boolean;
   evidence?: RemediationEvidence[];
   updatedAt?: string;
+  requiresConsoleAck?: boolean;
+  accessNotes?: string[];
 }

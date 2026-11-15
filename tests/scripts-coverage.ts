@@ -6,9 +6,6 @@
  * Jalankan: npx tsx tests/scripts-coverage.ts
  */
 import { execFileSync } from 'node:child_process';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import { buildRemediationScripts } from '../src/remediationScripts';
 import { buildRemediationItems, aliasForCheck } from '../src/remediationMapping';
 import type { DeviceInfo, SecurityCheck } from '../src/types';
@@ -119,10 +116,9 @@ const win = mkDevice('windows', winParams.map(([p, d], i) => mkCheck(i, p, d)), 
   check('Linux: skrip meminta root otomatis (sudo -E/marker/pkexec)', hard.includes('exec sudo -E bash') && hard.includes('PASOPATI_ELEVATED') && hard.includes('pkexec'));
   check('Linux: rollback juga meminta root', roll.includes('exec sudo -E bash') && roll.includes('PASOPATI_ELEVATED'));
 
-  const tmp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'pasopati-script-')), 'h.sh');
-  fs.writeFileSync(tmp, hard);
+  // Kirim skrip lewat stdin agar path Windows tidak perlu diterjemahkan WSL.
   try {
-    execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });
+    execFileSync('bash', ['-n'], { input: hard, stdio: 'pipe' });
     check('Linux: skrip lolos bash -n', true);
   } catch (e: any) {
     check('Linux: skrip lolos bash -n', false, String(e?.stderr || e?.message));
